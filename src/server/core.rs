@@ -486,9 +486,13 @@ impl ServerCore {
             };
             if ss.abandoned.contains(pn) {
                 core.empty_answer(ss, hq, now);
-            } else if ss.s.is_closed() || hold.is_zero() || ss.s.rx_data || ss.s.has_data() {
+            } else if ss.s.is_closed() || hold.is_zero() || ss.s.rx_data {
                 core.answer(ss, hq, now);
             } else {
+                // A poll joins the queue even when there's data to send: the drain below answers
+                // the queue oldest first, at once. Releasing polls in arrival order is what lets
+                // the client tell a lost poll from a held one; answering this one first would
+                // leave older polls looking lost.
                 core.held_deadlines
                     .push(Reverse((hq.deadline, ss.serial, hq.id)));
                 ss.held.push_back(hq);
@@ -768,6 +772,43 @@ mod tests {
         assert!(
             core.take_transmits().is_empty(),
             "a held poll was answered twice"
+        );
+    }
+
+    /// Held polls are released in arrival order, which the client relies on to tell a lost poll
+    /// from a held one. A later poll whose LOST frame makes data pending must not jump the queue.
+    #[test]
+    fn held_polls_are_released_oldest_first_even_when_a_poll_brings_data() {
+        let t0 = Instant::now();
+        let (mut core, z, s) = setup(t0);
+        let mut plain = vec![0x50];
+        frames::put_stream(&mut plain, 0, 0, b"\x03a:1", false, true);
+        exchange(
+            &mut core,
+            &query(&z, 1, &s.up.seal_up(s.sid, 0, &plain)),
+            t0,
+        );
+        let k = StreamKey { session: 1, id: 0 };
+        let poll = |pn: u64, extra: &[u8]| {
+            let mut p = vec![0x50];
+            p.extend_from_slice(extra);
+            p.resize(p.len().max(5), frames::PADDING);
+            s.up.seal_up(s.sid, pn, &p)
+        };
+        // Poll 1 is held, then carries the relay's data out.
+        assert!(exchange(&mut core, &query(&z, 2, &poll(1, &[frames::PING])), t0).is_empty());
+        core.write(k, b"response", t0).unwrap();
+        assert_eq!(core.take_transmits().len(), 1);
+        // Poll 2 is held: nothing left to send.
+        assert!(exchange(&mut core, &query(&z, 3, &poll(2, &[frames::PING])), t0).is_empty());
+        // Poll 3 reports poll 1's answer lost, so its data is pending again.
+        let mut lost = Vec::new();
+        frames::put_lost(&mut lost, &[1]);
+        let out = exchange(&mut core, &query(&z, 4, &poll(3, &lost)), t0);
+        assert!(!out.is_empty());
+        assert_eq!(
+            out[0].txn, 3,
+            "poll 2, held first, must be answered before poll 3"
         );
     }
 
