@@ -871,8 +871,11 @@ impl Session {
             st.rbuf.clear();
             st.rooo.clear();
             st.rgot = RangeSet::default();
-            // Ask the peer to stop sending; our own data is unaffected unless already done.
-            reset = st.done_sending() || st.sbuf.is_empty();
+            // Ask the peer to stop sending, but only once our FIN is acknowledged: a RESET
+            // before the peer has the FIN aborts the stream, and data already written would be
+            // lost. Until then the FIN goes out, and maybe_remove sends the RESET when the
+            // stream is done.
+            reset = st.done_sending();
         }
         st.dead = true;
         if reset {
@@ -1031,6 +1034,27 @@ mod tests {
         s.receive(0, &p, now);
         assert!(s.is_closed());
         let _ = c.open_stream("a:1");
+    }
+
+    #[test]
+    fn close_after_data_acked_still_delivers_the_fin() {
+        let now = Instant::now();
+        let (mut c, mut s) = pair();
+        let id = c.open_stream("a:1").unwrap();
+        c.write(id, b"request").unwrap();
+        let up = deliver(&mut c, &mut s, now);
+        c.acked(up); // the data is acknowledged: the send buffer is empty, the FIN unsent
+        c.close_stream(id);
+        c.release_stream(id);
+        deliver(&mut c, &mut s, now);
+        let mut buf = [0u8; 64];
+        assert_eq!(s.read(0, &mut buf), Read::Data(11));
+        assert_eq!(
+            s.read(0, &mut buf),
+            Read::Eof,
+            "the FIN arrives, not a RESET"
+        );
+        assert!(!s.stream_aborted(0));
     }
 
     #[test]

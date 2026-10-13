@@ -212,20 +212,19 @@ async fn serve_link(sh: &Arc<Shared>, conn: TcpStream, rx: &mut mpsc::Receiver<V
     let reader = async {
         let mut buf = vec![0u8; 65535];
         loop {
-            // A black-holed connection accepts writes for a long time; an idle read deadline
-            // closes it so the link redials (resolvers drop idle TCP/53 anyway).
-            let mut hdr = [0u8; 2];
-            let idle = Duration::from_secs(30);
-            if !matches!(
-                tokio::time::timeout(idle, rd.read_exact(&mut hdr)).await,
-                Ok(Ok(_))
-            ) {
+            // A black-holed connection accepts writes for a long time; a read deadline over
+            // each whole message closes it so the link redials (resolvers drop idle TCP/53
+            // anyway), including one that stalls partway through a message.
+            let msg = async {
+                let mut hdr = [0u8; 2];
+                rd.read_exact(&mut hdr).await?;
+                let n = usize::from(u16::from_be_bytes(hdr));
+                rd.read_exact(&mut buf[..n]).await?;
+                Ok::<_, io::Error>(n)
+            };
+            let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(30), msg).await else {
                 return;
-            }
-            let n = usize::from(u16::from_be_bytes(hdr));
-            if rd.read_exact(&mut buf[..n]).await.is_err() {
-                return;
-            }
+            };
             sh.core().handle_answer(&buf[..n], Instant::now());
             sh.kick.notify_one();
         }
