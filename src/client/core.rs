@@ -489,6 +489,8 @@ pub struct ClientCore {
     cand_idx: usize,
     last_cand: Option<Instant>,
     cached_verified: usize,
+    /// The runtime has no IPv6 UDP socket: IPv6 resolvers can only be reached over TCP.
+    no_udp6: bool,
     out: Vec<Transmit>,
     events: VecDeque<ClientEvent>,
 }
@@ -533,6 +535,7 @@ impl ClientCore {
             cand_idx: 0,
             last_cand: None,
             cached_verified: 0,
+            no_udp6: false,
             out: Vec::new(),
             events: VecDeque::new(),
             cfg,
@@ -544,6 +547,28 @@ impl ClientCore {
             return Err("soar: no usable resolvers".into());
         }
         Ok(c)
+    }
+
+    /// The runtime has no IPv6 UDP socket. IPv6 resolvers' UDP paths, whose sends would all fail
+    /// silently, are replaced by TCP paths (TCP needs no UDP socket), or dropped if TCP is off.
+    pub fn disable_udp6(&mut self, now: Instant) {
+        self.no_udp6 = true;
+        let v6: Vec<SocketAddr> = (self.paths.iter())
+            .filter(|p| !p.tcp && p.addr.is_ipv6())
+            .map(|p| p.addr)
+            .collect();
+        self.paths.retain(|p| p.tcp || !p.addr.is_ipv6());
+        for addr in v6 {
+            let has_tcp = self.paths.iter().any(|p| p.tcp && p.addr == addr);
+            if !has_tcp && self.cfg.tcp != TcpMode::Off {
+                self.new_path(addr, true, now);
+            }
+        }
+    }
+
+    /// How many resolver paths the client has.
+    pub fn path_count(&self) -> usize {
+        self.paths.len()
     }
 
     /// Adds discovery candidates, tried in order. Building them reads the cache and the system's
@@ -569,6 +594,13 @@ impl ClientCore {
         let stream_only = self.cfg.stream_only.as_ref().is_some_and(|f| f(spec));
         if self.cfg.tcp == TcpMode::Only || stream_only {
             self.new_path(addr, true, now);
+            return Ok(());
+        }
+        if self.no_udp6 && addr.is_ipv6() {
+            // No socket to send it UDP: TCP alone, unless TCP is off.
+            if self.cfg.tcp != TcpMode::Off {
+                self.new_path(addr, true, now);
+            }
             return Ok(());
         }
         self.new_path(addr, false, now);
@@ -1080,6 +1112,7 @@ impl ClientCore {
                 .or_else(|| self.pick_path(now, None));
             if let Some(p2) = p2
                 && self.paths.iter().any(|p| p.id == p2 && p.verified)
+                && self.live_queries() < self.cfg.max_inflight
             {
                 let s = self
                     .sess
@@ -1558,6 +1591,71 @@ mod tests {
         assert!(
             c.take_transmits().is_empty(),
             "the cancelled handshake kept retrying"
+        );
+    }
+
+    #[test]
+    fn ipv6_resolvers_without_a_udp6_socket_use_tcp() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let resolvers = ["[2001:db8::1]:53", "192.0.2.1:53"];
+        let mut c =
+            ClientCore::new(ClientConfig::new("t.example.com", key, &resolvers), now).unwrap();
+        c.disable_udp6(now);
+        let v6: Vec<bool> = c
+            .paths
+            .iter()
+            .filter(|p| p.addr.is_ipv6())
+            .map(|p| p.tcp)
+            .collect();
+        assert_eq!(v6, [true], "the IPv6 resolver is reached over TCP only");
+        let mut cfg = ClientConfig::new("t.example.com", key, &resolvers);
+        cfg.tcp = TcpMode::Off;
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        c.disable_udp6(now);
+        assert!(
+            c.paths.iter().all(|p| p.addr.is_ipv4()),
+            "with TCP off it's dropped"
+        );
+    }
+
+    #[test]
+    fn tail_copy_respects_max_inflight() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53", "192.0.2.2:53"]);
+        cfg.max_inflight = 1;
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        for p in &mut c.paths {
+            p.verified = true;
+        }
+        // An established session with a short request to send, whose tail would go out twice.
+        let pc = || crate::crypto::PacketCipher {
+            key: [1; 32],
+            iv: [2; 12],
+            hp: [3; 32],
+        };
+        let scfg = StreamConfig {
+            stream_window: 1 << 16,
+            send_buffer: 1 << 16,
+            max_streams: 4,
+        };
+        c.sess = Some(ClientSession {
+            generation: 1,
+            eph: StaticSecret::from([4; 32]),
+            s: Some(Session::new(true, scfg, pc(), pc())),
+            sid: 1,
+            backlog: 0,
+            last_auth: Some(now),
+            unanswered: None,
+        });
+        let r = c.open_stream("a:1").unwrap();
+        c.write(r, b"GET").unwrap();
+        c.tick(now);
+        assert_eq!(
+            c.take_transmits().len(),
+            1,
+            "the tail copy exceeded max_inflight"
         );
     }
 

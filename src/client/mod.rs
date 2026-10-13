@@ -65,7 +65,9 @@ struct Shared {
     kick: Notify,
     /// The newest established session's generation.
     established: watch::Sender<u64>,
-    cache: Option<mpsc::UnboundedSender<Vec<String>>>,
+    /// Feeds the cache writer. Taken on Drop, which closes the channel: the writer stores what's
+    /// queued, then exits.
+    cache: Mutex<Option<mpsc::UnboundedSender<Vec<String>>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -139,7 +141,7 @@ impl Shared {
                 }
             }
             ClientEvent::CacheStore(good) => {
-                if let Some(tx) = &self.cache {
+                if let Some(tx) = lock(&self.cache).as_ref() {
                     let _ = tx.send(good);
                 }
             }
@@ -276,6 +278,7 @@ impl Client {
     pub async fn new(cfg: ClientConfig) -> io::Result<Client> {
         let cache = cfg.discovery.cache.clone();
         let discovery = cfg.discovery.clone();
+        let discovery_enabled = discovery.enabled;
         let mut core = ClientCore::new(cfg, Instant::now()).map_err(io::Error::other)?;
         if discovery.enabled {
             // Reads the cache and /etc/resolv.conf: off the async workers, and out of the core.
@@ -286,17 +289,27 @@ impl Client {
         }
         let udp4 = UdpSocket::bind("0.0.0.0:0").await?;
         let udp6 = UdpSocket::bind("[::]:0").await.ok();
+        if udp6.is_none() {
+            core.disable_udp6(Instant::now());
+            if core.path_count() == 0 && !discovery_enabled {
+                return Err(io::Error::other(
+                    "soar: no usable resolvers (IPv6 resolvers, no IPv6 socket, TCP off)",
+                ));
+            }
+        }
         let mut tasks = Vec::new();
         let cache_tx = cache.map(|cache| {
             // One task stores snapshots in order, so a cache needn't be safe for concurrent use
             // and an older snapshot never lands last.
+            // It isn't aborted on Drop, so a snapshot queued just before shutdown is still stored:
+            // Drop closes the channel instead, and the writer exits once it has drained it.
             let (tx, mut rx) = mpsc::unbounded_channel::<Vec<String>>();
-            tasks.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 while let Some(good) = rx.recv().await {
                     let cache = cache.clone();
                     let _ = tokio::task::spawn_blocking(move || cache.store(&good)).await;
                 }
-            }));
+            });
             tx
         });
         let has6 = udp6.is_some();
@@ -308,7 +321,7 @@ impl Client {
             wakers: Mutex::new(HashMap::new()),
             kick: Notify::new(),
             established: watch::Sender::new(0),
-            cache: cache_tx,
+            cache: Mutex::new(cache_tx),
         });
         tasks.push(tokio::spawn(driver(sh.clone())));
         tasks.push(tokio::spawn(recv(sh.clone(), false)));
@@ -363,6 +376,7 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.sh.core().close();
+        lock(&self.sh.cache).take();
         // The driver won't dispatch the close any more: wake every stream's waiters now, so
         // Conns that outlive the Client see it closed rather than hanging.
         for w in lock(&self.sh.wakers).values_mut() {
