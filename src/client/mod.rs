@@ -253,7 +253,10 @@ async fn serve_link(sh: &Arc<Shared>, conn: TcpStream, rx: &mut mpsc::Receiver<V
     }
 }
 
-/// A tunnel client. Dropping it stops its tasks.
+/// A tunnel client. Dropping it ends the session at once and stops its tasks: data written to a
+/// [`Conn`] but not yet delivered is discarded, even if the Conn was flushed or shut down, since
+/// flushing hands bytes to the session, not to the server. Keep the Client until the streams
+/// that matter have finished, as you'd wait for an EOF before tearing down any connection.
 pub struct Client {
     sh: Arc<Shared>,
     tasks: Vec<JoinHandle<()>>,
