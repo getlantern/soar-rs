@@ -115,11 +115,17 @@ impl StreamSlots {
     }
 
     fn take(&self) -> bool {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.max).then_some(n + 1)
-            })
-            .is_ok()
+        let mut n = self.used.load(Ordering::Acquire);
+        while n < self.max {
+            match self
+                .used
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+        false
     }
 
     fn release(&self) {
