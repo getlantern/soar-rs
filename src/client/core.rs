@@ -692,10 +692,27 @@ impl ClientCore {
 
     /// Closes the session, aborting its streams.
     pub fn close(&mut self) {
-        if let Some(cs) = &mut self.sess
-            && let Some(s) = &mut cs.s
-        {
-            s.close("soar: closed");
+        match &mut self.sess {
+            Some(ClientSession { s: Some(s), .. }) => s.close("soar: closed"),
+            // A handshake in progress: forget it and its hellos, so it stops retrying and the
+            // next connect starts afresh.
+            Some(cs) => {
+                let generation = cs.generation;
+                self.sess = None;
+                let hellos: Vec<u16> = (self.pending.iter())
+                    .filter(|(_, q)| q.session == generation && !q.expired)
+                    .map(|(&t, _)| t)
+                    .collect();
+                for txn in hellos {
+                    let q = self.pending.remove(&txn).expect("listed");
+                    if let Some(p) = self.path_mut(q.path) {
+                        p.inflight = p.inflight.saturating_sub(1);
+                    }
+                }
+                self.events
+                    .push_back(ClientEvent::SessionClosed(generation));
+            }
+            None => {}
         }
         self.pump();
     }
@@ -952,8 +969,12 @@ impl ClientCore {
         payload.extend_from_slice(PublicKey::from(&cs.eph).as_bytes());
         let generation = cs.generation;
         let mut sent = 0;
-        let ids: Vec<u64> = self.paths.iter().map(|p| p.id).collect();
-        for id in ids {
+        // Least recently tried first (never-tried paths before all), so with more resolvers
+        // than MAX_HELLO_PATHS the retries rotate through all of them.
+        let mut order: Vec<(Option<Instant>, u64)> =
+            self.paths.iter().map(|p| (p.last_hello, p.id)).collect();
+        order.sort();
+        for (_, id) in order {
             if sent >= MAX_HELLO_PATHS || self.live_queries() >= self.cfg.max_inflight {
                 break;
             }
@@ -1495,6 +1516,49 @@ mod tests {
         c.tick(now);
         assert_eq!(c.take_transmits().len(), 1, "the hello goes out");
         assert_eq!(c.cfg.max_path_window, 32);
+    }
+
+    #[test]
+    fn hello_retries_rotate_through_every_resolver() {
+        let t0 = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let resolvers: Vec<String> = (1..=20).map(|i| format!("192.0.2.{i}:53")).collect();
+        let refs: Vec<&str> = resolvers.iter().map(String::as_str).collect();
+        let mut c = ClientCore::new(ClientConfig::new("t.example.com", key, &refs), t0).unwrap();
+        c.connect();
+        c.tick(t0);
+        assert_eq!(c.take_transmits().len(), MAX_HELLO_PATHS);
+        // Nothing answers; the hellos expire and retry. The four never tried go first.
+        let t1 = t0 + HELLO_RETRY + Duration::from_millis(1);
+        c.tick(t1);
+        let tried: Vec<SocketAddr> = c.take_transmits().iter().map(|t| t.to).collect();
+        for i in 17..=20 {
+            assert!(
+                tried.contains(&format!("192.0.2.{i}:53").parse().unwrap()),
+                "resolver {i} never tried"
+            );
+        }
+    }
+
+    #[test]
+    fn close_cancels_a_handshake_in_progress() {
+        let t0 = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let mut c = ClientCore::new(
+            ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]),
+            t0,
+        )
+        .unwrap();
+        c.connect();
+        c.tick(t0);
+        assert_eq!(c.take_transmits().len(), 1);
+        c.close();
+        assert!(c.pending.is_empty() && c.paths[0].inflight == 0);
+        c.tick(t0 + Duration::from_secs(5));
+        assert!(
+            c.take_transmits().is_empty(),
+            "the cancelled handshake kept retrying"
+        );
     }
 
     #[test]

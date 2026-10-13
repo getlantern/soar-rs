@@ -442,8 +442,31 @@ impl ServerCore {
         Some(r)
     }
 
+    /// Rebuilds the deadline index from the polls still held once stale entries (polls answered
+    /// early) could outnumber them, so its size is bounded by the held polls, not by query rate.
+    fn compact_deadlines(&mut self) {
+        let bound = 2 * MAX_HELD * self.sessions.len() + 1024;
+        if self.held_deadlines.len() <= bound {
+            return;
+        }
+        self.held_deadlines = self
+            .sessions
+            .values()
+            .flat_map(|ss| {
+                ss.held
+                    .iter()
+                    .map(|h| Reverse((h.deadline, ss.serial, h.id)))
+            })
+            .collect();
+    }
+
     /// Handles a data query: applies the client's packet, then answers now or holds the query.
     fn on_query(&mut self, sid: u16, q: Query, addr: SocketAddr, p: &[u8], now: Instant) {
+        self.on_session_query(sid, q, addr, p, now);
+        self.compact_deadlines();
+    }
+
+    fn on_session_query(&mut self, sid: u16, q: Query, addr: SocketAddr, p: &[u8], now: Instant) {
         self.with_session(sid, |core, ss| {
             let (largest, have) = (ss.s.largest_recv, ss.s.have_recv);
             let Ok((pn, plain)) =
@@ -809,6 +832,49 @@ mod tests {
         assert_eq!(
             out[0].txn, 3,
             "poll 2, held first, must be answered before poll 3"
+        );
+    }
+
+    /// A resolver's retry of a data-bearing query is answered at once like the original, not held.
+    #[test]
+    fn duplicate_data_query_is_answered_at_once() {
+        let t0 = Instant::now();
+        let (mut core, z, s) = setup(t0);
+        let mut plain = vec![0x50];
+        frames::put_stream(&mut plain, 0, 0, b"\x03a:1", false, true);
+        let packet = s.up.seal_up(s.sid, 0, &plain);
+        assert_eq!(exchange(&mut core, &query(&z, 1, &packet), t0).len(), 1);
+        assert_eq!(
+            exchange(&mut core, &query(&z, 2, &packet), t0).len(),
+            1,
+            "the retry was held"
+        );
+    }
+
+    /// Polls answered early leave stale deadline entries; the index stays bounded anyway.
+    #[test]
+    fn deadline_index_stays_bounded_by_held_polls() {
+        let t0 = Instant::now();
+        let (mut core, z, s) = setup(t0);
+        let mut plain = vec![0x50];
+        frames::put_stream(&mut plain, 0, 0, b"\x03a:1", false, true);
+        exchange(
+            &mut core,
+            &query(&z, 1, &s.up.seal_up(s.sid, 0, &plain)),
+            t0,
+        );
+        let k = StreamKey { session: 1, id: 0 };
+        for pn in 1..3000u64 {
+            let poll = s.up.seal_up(s.sid, pn, &[0x50, frames::PING, 0, 0, 0]);
+            exchange(&mut core, &query(&z, pn as u16, &poll), t0);
+            core.write(k, b"x", t0).unwrap(); // answers the poll at once
+            core.take_transmits();
+        }
+        let bound = 2 * MAX_HELD * core.session_count() + 1024;
+        assert!(
+            core.held_deadlines.len() <= bound,
+            "{} entries",
+            core.held_deadlines.len()
         );
     }
 

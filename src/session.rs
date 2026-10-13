@@ -330,6 +330,15 @@ impl Session {
     pub fn receive(&mut self, pn: u64, payload: &[u8], now: Instant) -> bool {
         // recvd only remembers the last REPLAY_WINDOW pns, so anything older is refused outright.
         if self.recvd.contains(pn) || (self.have_recv && pn + REPLAY_WINDOW < self.largest_recv) {
+            // A duplicate (a resolver's retry) isn't reapplied, but its frames still say whether
+            // it carried data, which decides whether the server may hold it (SPEC §7.2).
+            if let Ok(fs) = frames::parse(payload)
+                && fs
+                    .iter()
+                    .any(|f| !matches!(f, Frame::Ack(_) | Frame::Lost(_) | Frame::Ping))
+            {
+                self.rx_data = true;
+            }
             return false;
         }
         self.recvd.add(pn, pn + 1);
