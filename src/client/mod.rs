@@ -6,7 +6,6 @@ mod core;
 mod discovery;
 
 use std::collections::HashMap;
-use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -30,17 +29,15 @@ use crate::stream::StreamError;
 struct Wakers {
     read: Option<Waker>,
     write: Option<Waker>,
-    /// Every opened() waiting: callers may wait concurrently.
-    opened: Vec<Waker>,
+    /// Wakes every opened() waiting. Notify's waiters unregister themselves when a future is
+    /// dropped, so cancelled waits leave nothing behind.
+    opened: Arc<Notify>,
 }
 
 impl Wakers {
     fn wake_all(&mut self) {
-        for w in [self.read.take(), self.write.take()]
-            .into_iter()
-            .flatten()
-            .chain(self.opened.drain(..))
-        {
+        self.opened.notify_waiters();
+        for w in [self.read.take(), self.write.take()].into_iter().flatten() {
             w.wake();
         }
     }
@@ -114,8 +111,8 @@ impl Shared {
             ClientEvent::Readable(r) => wake(r, |w| w.read.take()),
             ClientEvent::Writable(r) => wake(r, |w| w.write.take()),
             ClientEvent::Opened(r) => {
-                if let Some(w) = lock(&self.wakers).get_mut(&r) {
-                    w.opened.drain(..).for_each(Waker::wake);
+                if let Some(w) = lock(&self.wakers).get(&r) {
+                    w.opened.notify_waiters();
                 }
             }
             ClientEvent::Aborted(r) => {
@@ -278,7 +275,15 @@ pub struct Client {
 impl Client {
     pub async fn new(cfg: ClientConfig) -> io::Result<Client> {
         let cache = cfg.discovery.cache.clone();
-        let core = ClientCore::new(cfg, Instant::now()).map_err(io::Error::other)?;
+        let discovery = cfg.discovery.clone();
+        let mut core = ClientCore::new(cfg, Instant::now()).map_err(io::Error::other)?;
+        if discovery.enabled {
+            // Reads the cache and /etc/resolv.conf: off the async workers, and out of the core.
+            let cands = tokio::task::spawn_blocking(move || discovery.candidates())
+                .await
+                .map_err(io::Error::other)?;
+            core.add_candidates(cands);
+        }
         let udp4 = UdpSocket::bind("0.0.0.0:0").await?;
         let udp6 = UdpSocket::bind("[::]:0").await.ok();
         let mut tasks = Vec::new();
@@ -391,22 +396,27 @@ fn stream_err(e: StreamError) -> io::Error {
 impl Conn {
     /// Waits for the server to report the stream's destination reachable.
     pub async fn opened(&self) -> io::Result<()> {
-        poll_fn(|cx| {
-            let mut c = self.sh.core();
-            if c.stream_opened(self.r) {
-                return Poll::Ready(Ok(()));
+        let notify = lock(&self.sh.wakers)
+            .entry(self.r)
+            .or_default()
+            .opened
+            .clone();
+        loop {
+            // Register before checking, so an Opened dispatched in between still wakes us.
+            let wait = notify.notified();
+            tokio::pin!(wait);
+            wait.as_mut().enable();
+            {
+                let mut c = self.sh.core();
+                if c.stream_opened(self.r) {
+                    return Ok(());
+                }
+                if c.stream_aborted(self.r) || c.established() != Some(self.r.session) {
+                    return Err(stream_err(StreamError::Unreachable));
+                }
             }
-            if c.stream_aborted(self.r) || c.established() != Some(self.r.session) {
-                return Poll::Ready(Err(stream_err(StreamError::Unreachable)));
-            }
-            let mut wakers = lock(&self.sh.wakers);
-            let opened = &mut wakers.entry(self.r).or_default().opened;
-            if !opened.iter().any(|w| w.will_wake(cx.waker())) {
-                opened.push(cx.waker().clone());
-            }
-            Poll::Pending
-        })
-        .await
+            wait.await;
+        }
     }
 }
 

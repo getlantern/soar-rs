@@ -497,6 +497,23 @@ impl ClientCore {
     pub fn new(cfg: ClientConfig, now: Instant) -> Result<ClientCore, String> {
         let zone = Zone::parse(&cfg.zone).map_err(|e| e.to_string())?;
         let mut cfg = cfg;
+        // Zero means "the default", as in the Go client: a zero window or in-flight limit would
+        // otherwise schedule nothing and hang.
+        let d = ClientConfig::new("", cfg.server_key, &[]);
+        let or = |v: usize, d: usize| if v == 0 { d } else { v };
+        cfg.safe_qname = or(cfg.safe_qname, d.safe_qname);
+        cfg.max_qname = or(cfg.max_qname, d.max_qname);
+        cfg.max_inflight = or(cfg.max_inflight, d.max_inflight);
+        cfg.max_path_window = or(cfg.max_path_window, d.max_path_window);
+        cfg.max_answer = or(cfg.max_answer, d.max_answer);
+        cfg.send_buffer = or(cfg.send_buffer, d.send_buffer);
+        cfg.max_streams = or(cfg.max_streams, d.max_streams);
+        if cfg.stream_window == 0 {
+            cfg.stream_window = d.stream_window;
+        }
+        if cfg.hold.is_zero() {
+            cfg.hold = d.hold;
+        }
         cfg.max_qname = cfg.max_qname.min(dns::MAX_NAME);
         cfg.safe_qname = cfg.safe_qname.min(cfg.max_qname);
         if zone.max_payload(cfg.safe_qname) < 2 + PUB_LEN {
@@ -526,10 +543,14 @@ impl ClientCore {
         if c.paths.is_empty() && !c.cfg.discovery.enabled {
             return Err("soar: no usable resolvers".into());
         }
-        if c.cfg.discovery.enabled {
-            c.cands = c.cfg.discovery.candidates();
-        }
         Ok(c)
+    }
+
+    /// Adds discovery candidates, tried in order. Building them reads the cache and the system's
+    /// resolver list, which is I/O, so the runtime does that (see Discovery::candidates) and
+    /// hands the result in.
+    pub fn add_candidates(&mut self, cands: Vec<String>) {
+        self.cands.extend(cands);
     }
 
     pub fn take_transmits(&mut self) -> Vec<Transmit> {
@@ -1407,7 +1428,9 @@ mod tests {
         cfg.discovery.no_bundled = true;
         cfg.discovery.want = 1;
         cfg.discovery.candidates = vec!["192.0.2.2:53".into()];
+        let cands = cfg.discovery.candidates();
         let mut c = ClientCore::new(cfg, now).unwrap();
+        c.add_candidates(cands);
         let id = c.paths[0].id;
         c.paths[0].verified = true;
         c.discover(now);
@@ -1432,6 +1455,19 @@ mod tests {
             2,
             "discovery resumes with the next candidate"
         );
+    }
+
+    #[test]
+    fn zero_limits_mean_the_defaults() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
+        (cfg.max_inflight, cfg.max_path_window, cfg.max_streams) = (0, 0, 0);
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        c.connect();
+        c.tick(now);
+        assert_eq!(c.take_transmits().len(), 1, "the hello goes out");
+        assert_eq!(c.cfg.max_path_window, 32);
     }
 
     #[test]
