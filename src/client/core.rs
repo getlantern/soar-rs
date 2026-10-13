@@ -1240,11 +1240,14 @@ impl ClientCore {
         if !self.cfg.discovery.enabled {
             return;
         }
-        let (mut verified, mut probing) = (0, 0);
+        // Only paths that work now count toward `want`: a path verified once and since blocked
+        // must not keep discovery stopped while untried candidates remain.
+        let (mut verified, mut healthy, mut probing) = (0, 0, 0);
         let mut stopped = Vec::new();
         self.paths.retain(|p| {
             if p.verified {
                 verified += 1;
+                healthy += usize::from(p.usable(now));
                 return true;
             }
             if p.candidate
@@ -1277,7 +1280,7 @@ impl ClientCore {
             self.events.push_back(ClientEvent::CacheStore(good));
         }
         let d = &self.cfg.discovery;
-        if verified >= d.want || probing >= d.concurrency || since(now, self.last_cand) < d.pace {
+        if healthy >= d.want || probing >= d.concurrency || since(now, self.last_cand) < d.pace {
             return;
         }
         while self.cand_idx < self.cands.len() {
@@ -1384,6 +1387,29 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_resumes_when_verified_paths_fail() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
+        cfg.discovery.enabled = true;
+        cfg.discovery.no_bundled = true;
+        cfg.discovery.want = 1;
+        cfg.discovery.candidates = vec!["192.0.2.2:53".into()];
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        c.paths[0].verified = true;
+        c.discover(now);
+        assert_eq!(c.paths.len(), 1, "one healthy path is enough");
+        // The verified resolver gets blocked: it's suspended after a run of losses.
+        c.paths[0].suspended = Some(now + Duration::from_secs(10));
+        c.discover(now + Duration::from_secs(1));
+        assert_eq!(
+            c.paths.len(),
+            2,
+            "discovery resumes with the next candidate"
+        );
+    }
 
     #[test]
     fn even_loss_never_moves_answer_size() {

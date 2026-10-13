@@ -30,14 +30,16 @@ use crate::stream::StreamError;
 struct Wakers {
     read: Option<Waker>,
     write: Option<Waker>,
-    opened: Option<Waker>,
+    /// Every opened() waiting: callers may wait concurrently.
+    opened: Vec<Waker>,
 }
 
 impl Wakers {
     fn wake_all(&mut self) {
-        for w in [self.read.take(), self.write.take(), self.opened.take()]
+        for w in [self.read.take(), self.write.take()]
             .into_iter()
             .flatten()
+            .chain(self.opened.drain(..))
         {
             w.wake();
         }
@@ -104,7 +106,11 @@ impl Shared {
             }
             ClientEvent::Readable(r) => wake(r, |w| w.read.take()),
             ClientEvent::Writable(r) => wake(r, |w| w.write.take()),
-            ClientEvent::Opened(r) => wake(r, |w| w.opened.take()),
+            ClientEvent::Opened(r) => {
+                if let Some(w) = lock(&self.wakers).get_mut(&r) {
+                    w.opened.drain(..).for_each(Waker::wake);
+                }
+            }
             ClientEvent::Aborted(r) => {
                 if let Some(w) = lock(&self.wakers).get_mut(&r) {
                     w.wake_all();
@@ -375,7 +381,11 @@ impl Conn {
             if c.stream_aborted(self.r) || c.established() != Some(self.r.session) {
                 return Poll::Ready(Err(stream_err(StreamError::Unreachable)));
             }
-            self.sh.register(self.r, cx, |w| &mut w.opened);
+            let mut wakers = lock(&self.sh.wakers);
+            let opened = &mut wakers.entry(self.r).or_default().opened;
+            if !opened.iter().any(|w| w.will_wake(cx.waker())) {
+                opened.push(cx.waker().clone());
+            }
             Poll::Pending
         })
         .await
