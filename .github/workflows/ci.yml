@@ -23,3 +23,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: vectors match the pinned getlantern/soar commit
         run: scripts/sync-vectors.sh --check
+
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: interop/go.mod
+          cache-dependency-path: interop/go.sum
+      - name: Go client against the Rust server
+        run: interop/run.sh
+      - name: Rust client against the Go server
+        run: interop/run-reverse.sh

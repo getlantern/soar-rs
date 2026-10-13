@@ -239,6 +239,7 @@ pub fn put_stream(
 }
 
 impl Frame<'_> {
+    #[cfg(test)]
     pub fn put(&self, b: &mut Vec<u8>) {
         match self {
             Frame::Ping => b.push(PING),
