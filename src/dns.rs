@@ -43,8 +43,10 @@ impl Zone {
         if s.is_empty() {
             return Err(Error::Zone("empty zone"));
         }
-        if !s.is_ascii() {
-            return Err(Error::Zone("zone must be ASCII"));
+        // Labels are 1-63 printable ASCII characters (SPEC §3.1), so every implementation
+        // accepts the same zones and folds their case the same way.
+        if !s.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+            return Err(Error::Zone("zone must be printable ASCII"));
         }
         let mut wire = Vec::with_capacity(s.len() + 1);
         let mut labels = 0;

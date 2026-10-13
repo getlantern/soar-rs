@@ -112,3 +112,17 @@ async fn dropping_serve_releases_the_socket() {
     }
     assert!(rebound, "the server's socket outlived serve");
 }
+
+/// A zero-length read completes at once, with nothing read, rather than waiting for data.
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_length_read_completes_at_once() {
+    let (server, _srv) = start_server().await;
+    let quiet = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let quiet_addr = quiet.local_addr().unwrap().to_string();
+    let c = client(&server).await;
+    let mut conn = c.connect_opened(&quiet_addr).await.unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(1), conn.read(&mut []))
+        .await
+        .expect("a zero-length read waited for data");
+    assert_eq!(n.unwrap(), 0);
+}

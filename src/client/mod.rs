@@ -426,6 +426,9 @@ impl AsyncRead for Conn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(())); // nothing to read into: done, without waiting for data
+        }
         let mut c = self.sh.core();
         match c.read(self.r, buf.initialize_unfilled()) {
             Read::Data(n) => {

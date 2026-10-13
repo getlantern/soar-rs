@@ -738,6 +738,12 @@ impl ClientCore {
                 next = next.min(s);
             }
         }
+        // Discovery adds one candidate per tick: wake when the pace allows the next one, or on a
+        // network where nothing answers the pace would decay to the query timeout.
+        if self.discovery_wants_candidate(now) {
+            let d = &self.cfg.discovery;
+            next = next.min(self.last_cand.map_or(now, |t| t + d.pace));
+        }
         next.max(now + Duration::from_millis(1))
     }
 
@@ -1263,6 +1269,29 @@ impl ClientCore {
         }
     }
 
+    /// Whether discovery has candidates left and room to probe another: too few healthy paths,
+    /// and fewer unverified candidates in flight than its concurrency allows.
+    fn discovery_wants_candidate(&self, now: Instant) -> bool {
+        let d = &self.cfg.discovery;
+        if !d.enabled || self.cand_idx >= self.cands.len() {
+            return false;
+        }
+        let healthy = self.paths.iter().filter(|p| Self::healthy(p, now)).count();
+        let probing = self
+            .paths
+            .iter()
+            .filter(|p| !p.verified && p.candidate)
+            .count();
+        healthy < d.want && probing < d.concurrency
+    }
+
+    /// A verified path that works now. A path on a run of losses isn't healthy even when it's
+    /// usable: the client never suspends its last usable path, so that one stays usable while
+    /// failing.
+    fn healthy(p: &Path, now: Instant) -> bool {
+        p.verified && p.usable(now) && p.consec < 5
+    }
+
     /// Adds candidate paths at the configured pace while too few paths are verified, and prunes
     /// candidates that failed without ever answering.
     fn discover(&mut self, now: Instant) {
@@ -1276,9 +1305,7 @@ impl ClientCore {
         self.paths.retain(|p| {
             if p.verified {
                 verified += 1;
-                // A path on a run of losses isn't healthy even when it's usable: the client
-                // never suspends its last usable path, so that one stays usable while failing.
-                healthy += usize::from(p.usable(now) && p.consec < 5);
+                healthy += usize::from(Self::healthy(p, now));
                 return true;
             }
             if p.candidate

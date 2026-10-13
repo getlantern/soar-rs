@@ -80,7 +80,7 @@ impl DialPolicy {
     }
 }
 
-const NON_PUBLIC_V4: [(u32, u32); 13] = [
+const NON_PUBLIC_V4: [(u32, u32); 14] = [
     (0x0000_0000, 8),  // "this network"
     (0x0A00_0000, 8),  // private
     (0x6440_0000, 10), // CGNAT
@@ -89,6 +89,7 @@ const NON_PUBLIC_V4: [(u32, u32); 13] = [
     (0xAC10_0000, 12), // private
     (0xC000_0000, 24), // IETF protocol assignments
     (0xC000_0200, 24), // TEST-NET-1
+    (0xC058_6300, 24), // 6to4 relay anycast (RFC 7526)
     (0xC0A8_0000, 16), // private
     (0xC612_0000, 15), // benchmarking
     (0xC633_6400, 24), // TEST-NET-2
@@ -139,12 +140,14 @@ pub fn is_public(a: IpAddr) -> bool {
             if !in_v6(v, 0x2000 << 112, 3) && !in_v6(v, 0x0064_ff9b << 96, 96) {
                 return false;
             }
-            const NON_PUBLIC_V6: [(u128, u32); 6] = [
+            const NON_PUBLIC_V6: [(u128, u32); 8] = [
                 (0x0064_ff9b_0001 << 80, 48), // local-use NAT64
                 (0x2001_0000 << 96, 32),      // Teredo: tunnels to arbitrary IPv4
                 (0x2001_0db8 << 96, 32),      // documentation
                 (0x2001_0002 << 96, 48),      // benchmarking
                 (0x2001_0010 << 96, 28),      // ORCHID
+                (0x2001_0020 << 96, 28),      // ORCHIDv2
+                (0x3fff << 112, 20),          // documentation (RFC 9637)
                 (0xfc00 << 112, 7),           // unique local
             ];
             if NON_PUBLIC_V6.iter().any(|&(n, b)| in_v6(v, n, b)) {
@@ -219,6 +222,9 @@ mod tests {
             "2001:db8::1",
             "::ffff:127.0.0.1",
             "64:ff9b::7f00:1",
+            "192.88.99.1",
+            "2001:20::1",
+            "3fff::1",
             "2002:7f00:1::1",
             "2001::1",
         ] {

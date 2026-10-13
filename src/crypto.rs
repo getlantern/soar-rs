@@ -111,7 +111,8 @@ impl PacketCipher {
     }
 
     /// Builds an upstream packet: the session id, the protected truncated packet number, and the
-    /// sealed plaintext. The first two are the associated data, unprotected.
+    /// sealed plaintext. The associated data is the session id and the truncated packet number
+    /// unmasked; on the wire the packet number is masked.
     pub fn seal_up(&self, sid: u16, pn: u64, plain: &[u8]) -> Vec<u8> {
         let mut hdr = [0u8; 4];
         hdr[..2].copy_from_slice(&sid.to_be_bytes());
