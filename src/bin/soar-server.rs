@@ -90,6 +90,27 @@ fn parse_args(args: &[String]) -> Args {
     a
 }
 
+/// Binds every interface on port: a dual-stack socket, with IPV6_V6ONLY cleared explicitly rather
+/// than left to the platform default (IPv6-only on Windows, OpenBSD, and Linux with bindv6only),
+/// or IPv4 alone where the host has no IPv6.
+fn bind_any(port: u16) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    let dual = || -> std::io::Result<Socket> {
+        let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        s.set_only_v6(false)?;
+        s.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+        Ok(s)
+    };
+    let socket = dual().or_else(|_| {
+        let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
+        Ok::<_, std::io::Error>(s)
+    })?;
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket.into())
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -128,18 +149,15 @@ async fn main() {
         allow_private: a.allow_private,
         ..DialPolicy::default()
     };
-    // Go-style ":53" means every interface.
-    let listen = if a.listen.starts_with(':') {
-        format!("[::]{}", a.listen)
-    } else {
-        a.listen.clone()
-    };
-    let socket = match UdpSocket::bind(&listen).await {
-        Ok(s) => s,
-        Err(_) if a.listen.starts_with(':') => UdpSocket::bind(format!("0.0.0.0{}", a.listen))
+    // Go-style ":53" means every interface, over IPv4 and IPv6 alike, as in the Go server.
+    let socket = match a.listen.strip_prefix(':') {
+        Some(port) => {
+            let port: u16 = port.parse().unwrap_or_else(|_| fatal("bad -listen port"));
+            bind_any(port).unwrap_or_else(|e| fatal(e))
+        }
+        None => UdpSocket::bind(&a.listen)
             .await
             .unwrap_or_else(|e| fatal(e)),
-        Err(e) => fatal(e),
     };
     // Log hygiene: never the zone or the key. Either one in a leaked log hands a censor the
     // string it needs to block this server; `soar-server pubkey` prints the key on demand.

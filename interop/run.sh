@@ -5,7 +5,8 @@ cd "$(dirname "$0")/.."
 
 cargo build --release --bin soar-server
 tmp=$(mktemp -d)
-trap 'kill $pid 2>/dev/null || true; rm -rf "$tmp"' EXIT
+pid=
+trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$tmp"' EXIT
 
 (umask 077; target/release/soar-server keygen | awk '$1 == "private" { print $2 }' > "$tmp/key")
 pub=$(target/release/soar-server pubkey "$tmp/key")

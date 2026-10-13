@@ -219,7 +219,9 @@ func upload(c *soar.Client, origin string) error {
 	if _, err := conn.Write(append([]byte("sink\n"), pattern(n)...)); err != nil {
 		return err
 	}
-	conn.(interface{ CloseWrite() error }).CloseWrite()
+	if err := conn.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
+		return err
+	}
 	got, err := io.ReadAll(conn)
 	if err != nil {
 		return err
@@ -246,7 +248,10 @@ func concurrent(c *soar.Client, origin string) error {
 
 // unreachable: a refused destination comes back as a reset stream, not a hang.
 func unreachable(c *soar.Client, _ string) error {
-	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
 	addr := ln.Addr().String()
 	ln.Close() // nothing listens here now
 	ctx, cancel := ctx()

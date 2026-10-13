@@ -4,7 +4,8 @@ set -eu
 cd "$(dirname "$0")/.."
 
 tmp=$(mktemp -d)
-trap 'kill $pid 2>/dev/null || true; rm -rf "$tmp"' EXIT
+pid=
+trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$tmp"' EXIT
 
 # The Go server at the commit interop/go.mod pins.
 (cd interop && go build -o "$tmp/soar-server" github.com/getlantern/soar/cmd/soar-server)

@@ -1,7 +1,8 @@
 //! The server as a state machine: DNS messages in, DNS messages out, stream events for whoever
 //! relays streams to their destinations. No I/O and no clock; see [`super`] for the runtime.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -91,6 +92,8 @@ struct HelloEntry {
 }
 
 struct HeldQuery {
+    /// Names it in the deadline index.
+    id: u64,
     q: Query,
     addr: SocketAddr,
     up_pn: u64,
@@ -161,6 +164,11 @@ pub struct ServerCore {
     rrl: HashMap<(bool, u128), Bucket>,
     rrl_overflow: Option<Bucket>,
     next_sweep: Instant,
+    /// Held polls' deadlines, earliest first, so timers cost O(log n) rather than a scan of
+    /// every held poll on every wakeup. Entries for polls answered early go stale; they're
+    /// skipped when they come due.
+    held_deadlines: BinaryHeap<Reverse<(Instant, u64, u64)>>,
+    next_held_id: u64,
     out: Vec<Transmit>,
     events: VecDeque<ServerEvent>,
 }
@@ -181,6 +189,8 @@ impl ServerCore {
             rrl: HashMap::new(),
             rrl_overflow: None,
             next_sweep: now + SWEEP_EVERY,
+            held_deadlines: BinaryHeap::new(),
+            next_held_id: 0,
             out: Vec::new(),
             events: VecDeque::new(),
         })
@@ -206,10 +216,11 @@ impl ServerCore {
 
     /// When handle_timeout next needs to run.
     pub fn poll_timeout(&self) -> Instant {
-        self.sessions
-            .values()
-            .flat_map(|ss| ss.held.iter().map(|h| h.deadline))
-            .fold(self.next_sweep, Instant::min)
+        self.held_deadlines
+            .peek()
+            .map_or(self.next_sweep, |Reverse((d, ..))| {
+                (*d).min(self.next_sweep)
+            })
     }
 
     /// Handles a DNS message from addr.
@@ -463,7 +474,9 @@ impl ServerCore {
                 }
             }
             let hold = (Duration::from_millis(100) * hold_class).min(core.cfg.max_hold);
+            core.next_held_id += 1;
             let hq = HeldQuery {
+                id: core.next_held_id,
                 limit: (512 + 48 * size_class).min(q.edns),
                 q,
                 addr,
@@ -476,6 +489,8 @@ impl ServerCore {
             } else if ss.s.is_closed() || hold.is_zero() || ss.s.rx_data || ss.s.has_data() {
                 core.answer(ss, hq, now);
             } else {
+                core.held_deadlines
+                    .push(Reverse((hq.deadline, ss.serial, hq.id)));
                 ss.held.push_back(hq);
                 while ss.held.len() > MAX_HELD {
                     let oldest = ss.held.pop_front().expect("nonempty");
@@ -535,10 +550,16 @@ impl ServerCore {
     /// Answers expired held polls, and every 250ms declares stale downstream packets lost and
     /// ends idle sessions.
     pub fn handle_timeout(&mut self, now: Instant) {
-        let sids: Vec<u16> = self.sessions.keys().copied().collect();
-        for &sid in &sids {
+        while let Some(&Reverse((deadline, serial, id))) = self.held_deadlines.peek() {
+            if deadline > now {
+                break;
+            }
+            self.held_deadlines.pop();
+            let Some(&sid) = self.serials.get(&serial) else {
+                continue;
+            };
             self.with_session(sid, |core, ss| {
-                while let Some(i) = ss.held.iter().position(|h| h.deadline <= now) {
+                if let Some(i) = ss.held.iter().position(|h| h.id == id) {
                     let hq = ss.held.remove(i).expect("found");
                     core.answer(ss, hq, now);
                 }
@@ -547,6 +568,7 @@ impl ServerCore {
         if now < self.next_sweep {
             return;
         }
+        let sids: Vec<u16> = self.sessions.keys().copied().collect();
         self.next_sweep = now + SWEEP_EVERY;
         let hello_ttl = Duration::from_secs(60);
         let sessions = &self.sessions;
@@ -711,6 +733,27 @@ mod tests {
         assert_eq!(out.len(), 1);
         let plain = open(&s, &dns::parse_answer(&out[0].msg).unwrap(), 0);
         assert_eq!(plain[0], 50, "held 500 ms, in 10 ms units");
+    }
+
+    #[test]
+    fn poll_answered_early_is_not_answered_again_at_its_deadline() {
+        let t0 = Instant::now();
+        let (mut core, z, s) = setup(t0);
+        let poll = s.up.seal_up(s.sid, 0, &[0x50, frames::PING, 0, 0, 0]);
+        assert!(exchange(&mut core, &query(&z, 3, &poll), t0).is_empty());
+        // A data query opens a stream: the server now has data (its window grant) and answers
+        // the held poll early, along with the data query.
+        let mut plain = vec![0x50];
+        frames::put_stream(&mut plain, 0, 0, b"\x03a:1", false, true);
+        let msg = query(&z, 4, &s.up.seal_up(s.sid, 1, &plain));
+        let answered = exchange(&mut core, &msg, t0 + Duration::from_millis(10)).len();
+        assert!(answered >= 1);
+        // The poll's index entry is now stale: its deadline passes without a second answer.
+        core.handle_timeout(t0 + Duration::from_millis(600));
+        assert!(
+            core.take_transmits().is_empty(),
+            "a held poll was answered twice"
+        );
     }
 
     #[test]
