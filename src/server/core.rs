@@ -739,16 +739,31 @@ mod tests {
     fn poll_answered_early_is_not_answered_again_at_its_deadline() {
         let t0 = Instant::now();
         let (mut core, z, s) = setup(t0);
-        let poll = s.up.seal_up(s.sid, 0, &[0x50, frames::PING, 0, 0, 0]);
-        assert!(exchange(&mut core, &query(&z, 3, &poll), t0).is_empty());
-        // A data query opens a stream: the server now has data (its window grant) and answers
-        // the held poll early, along with the data query.
+        // Open a stream; its answer carries the window grant, so nothing is left to send.
         let mut plain = vec![0x50];
         frames::put_stream(&mut plain, 0, 0, b"\x03a:1", false, true);
-        let msg = query(&z, 4, &s.up.seal_up(s.sid, 1, &plain));
-        let answered = exchange(&mut core, &msg, t0 + Duration::from_millis(10)).len();
-        assert!(answered >= 1);
-        // The poll's index entry is now stale: its deadline passes without a second answer.
+        assert_eq!(
+            exchange(
+                &mut core,
+                &query(&z, 3, &s.up.seal_up(s.sid, 0, &plain)),
+                t0
+            )
+            .len(),
+            1
+        );
+        let k = StreamKey { session: 1, id: 0 };
+        // A poll is held: there's nothing to send.
+        let poll = s.up.seal_up(s.sid, 1, &[0x50, frames::PING, 0, 0, 0]);
+        assert!(exchange(&mut core, &query(&z, 4, &poll), t0).is_empty());
+        // The relay writes data: it goes out at once, in the held poll.
+        let later = t0 + Duration::from_millis(10);
+        assert_eq!(core.write(k, b"response", later), Ok(8));
+        assert_eq!(
+            core.take_transmits().len(),
+            1,
+            "the held poll carries the data at once"
+        );
+        // Its index entry is now stale: the deadline passes without a second answer.
         core.handle_timeout(t0 + Duration::from_millis(600));
         assert!(
             core.take_transmits().is_empty(),

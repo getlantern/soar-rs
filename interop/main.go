@@ -256,7 +256,7 @@ func unreachable(c *soar.Client, _ string) error {
 	ln.Close() // nothing listens here now
 	ctx, cancel := ctx()
 	defer cancel()
-	_, err := c.NewRoundTripper(ctx, addr)
+	_, err = c.NewRoundTripper(ctx, addr)
 	if err == nil {
 		return errors.New("connected to a closed port")
 	}
