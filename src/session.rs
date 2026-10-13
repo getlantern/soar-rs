@@ -173,7 +173,6 @@ pub struct Session {
     ctrl_q: VecDeque<Ctrl>,
 
     closed: bool,
-    close_reason: Option<String>,
     events: VecDeque<Event>,
     slots: Option<Arc<StreamSlots>>,
     /// Server: upstream packet numbers the client reported lost that had no recorded reply.
@@ -204,7 +203,6 @@ impl Session {
             rr: VecDeque::new(),
             ctrl_q: VecDeque::new(),
             closed: false,
-            close_reason: None,
             events: VecDeque::new(),
             slots: None,
             lost_unknown: Vec::new(),
@@ -222,10 +220,6 @@ impl Session {
 
     pub fn is_closed(&self) -> bool {
         self.closed
-    }
-
-    pub fn close_reason(&self) -> Option<&str> {
-        self.close_reason.as_deref()
     }
 
     pub fn stream_count(&self) -> usize {
@@ -306,12 +300,12 @@ impl Session {
         self.rr.retain(|&x| x != id);
     }
 
-    pub fn close(&mut self, reason: &str) {
+    /// Ends the session, aborting its streams. The reason documents the call site.
+    pub fn close(&mut self, _reason: &str) {
         if self.closed {
             return;
         }
         self.closed = true;
-        self.close_reason = Some(reason.to_owned());
         for (id, mut st) in self.streams.drain() {
             st.abort(StreamError::SessionClosed);
             if !self.client

@@ -1,5 +1,6 @@
 # RU IPv4 ranges from ripencc delegation stats (2026-10-10), the 2000 largest. Regenerate with:
 #   go run ./data/genranges -cc RU -rir ripencc
+# in getlantern/soar, then copy the file here: these lists match the Go client's.
 5.136.0.0/13
 95.24.0.0/13
 178.64.0.0/13

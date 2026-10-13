@@ -1,5 +1,6 @@
 # CN IPv4 ranges from apnic delegation stats (2026-10-10), the 2000 largest. Regenerate with:
 #   go run ./data/genranges -cc CN -rir apnic
+# in getlantern/soar, then copy the file here: these lists match the Go client's.
 36.128.0.0/10
 39.128.0.0/10
 59.192.0.0/10

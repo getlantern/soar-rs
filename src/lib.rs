@@ -12,7 +12,7 @@ mod error;
 mod frames;
 mod ranges;
 pub mod server;
-pub mod session;
+mod session;
 mod stream;
 mod varint;
 
@@ -20,4 +20,5 @@ mod varint;
 mod vectors;
 
 pub use error::Error;
+pub use session::Read;
 pub use stream::StreamError;

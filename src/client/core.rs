@@ -1156,7 +1156,15 @@ impl ClientCore {
         }
         self.pending.remove(&a.txn);
         cs.last_auth = Some(now);
-        cs.unanswered = None;
+        // The liveness clock runs from the first query since the last authenticated answer.
+        // With other queries still out, it restarts now rather than stopping: if every path
+        // then goes dead, nothing new is sent to restart it, and the session must still be
+        // presumed lost in time.
+        let others = self
+            .pending
+            .values()
+            .any(|q| !q.expired && !q.hello && q.session == generation);
+        cs.unanswered = others.then_some(now);
         let held = Duration::from_millis(10 * u64::from(plain[0]));
         cs.backlog = usize::from(plain[1]);
         s.receive(pn, &plain[2..], now);
@@ -1247,7 +1255,9 @@ impl ClientCore {
         self.paths.retain(|p| {
             if p.verified {
                 verified += 1;
-                healthy += usize::from(p.usable(now));
+                // A path on a run of losses isn't healthy even when it's usable: the client
+                // never suspends its last usable path, so that one stays usable while failing.
+                healthy += usize::from(p.usable(now) && p.consec < 5);
                 return true;
             }
             if p.candidate
@@ -1398,11 +1408,24 @@ mod tests {
         cfg.discovery.want = 1;
         cfg.discovery.candidates = vec!["192.0.2.2:53".into()];
         let mut c = ClientCore::new(cfg, now).unwrap();
+        let id = c.paths[0].id;
         c.paths[0].verified = true;
         c.discover(now);
         assert_eq!(c.paths.len(), 1, "one healthy path is enough");
-        // The verified resolver gets blocked: it's suspended after a run of losses.
-        c.paths[0].suspended = Some(now + Duration::from_secs(10));
+        // The verified resolver stops answering: its queries fail one after another. As the
+        // only path it is never suspended, so it stays usable, but it isn't healthy.
+        for i in 0..6 {
+            let at = now + Duration::from_millis(100 * i);
+            let q = c.query(id, 0, at);
+            c.send(id, q, &[0; 20], at, Duration::from_secs(1));
+            let txn = *c.pending.keys().next().expect("sent");
+            c.fail(txn, at, false);
+            c.pending.remove(&txn);
+        }
+        assert!(
+            c.paths[0].usable(now + Duration::from_secs(1)),
+            "the last path is kept usable"
+        );
         c.discover(now + Duration::from_secs(1));
         assert_eq!(
             c.paths.len(),

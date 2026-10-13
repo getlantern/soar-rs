@@ -51,11 +51,18 @@ struct Link {
     task: JoinHandle<()>,
 }
 
+/// The TCP links, and whether the client is shutting down: once it is, no link may start.
+#[derive(Default)]
+struct Links {
+    by_addr: HashMap<SocketAddr, Link>,
+    closed: bool,
+}
+
 struct Shared {
     core: Mutex<ClientCore>,
     udp4: UdpSocket,
     udp6: Option<UdpSocket>,
-    links: Mutex<HashMap<SocketAddr, Link>>,
+    links: Mutex<Links>,
     wakers: Mutex<HashMap<StreamRef, Wakers>>,
     /// Wakes the driver: something changed that may need sending.
     kick: Notify,
@@ -76,7 +83,7 @@ impl Shared {
     async fn transmit(self: &Arc<Self>, t: Transmit) {
         if t.tcp {
             // A full queue drops the message, which the query's deadline treats as loss.
-            if let Some(l) = lock(&self.links).get(&t.to) {
+            if let Some(l) = lock(&self.links).by_addr.get(&t.to) {
                 let _ = l.tx.try_send(t.msg);
             }
             return;
@@ -117,14 +124,20 @@ impl Shared {
                 }
             }
             ClientEvent::TcpStart(addr) => {
+                // Checked and inserted under one lock with Drop's shutdown, so a driver that
+                // was mid-dispatch when the client dropped can't start a link that outlives it.
+                let mut links = lock(&self.links);
+                if links.closed {
+                    return;
+                }
                 let (tx, rx) = mpsc::channel(256);
                 let task = tokio::spawn(tcp_link(self.clone(), addr, rx));
-                if let Some(old) = lock(&self.links).insert(addr, Link { tx, task }) {
+                if let Some(old) = links.by_addr.insert(addr, Link { tx, task }) {
                     old.task.abort();
                 }
             }
             ClientEvent::TcpStop(addr) => {
-                if let Some(l) = lock(&self.links).remove(&addr) {
+                if let Some(l) = lock(&self.links).by_addr.remove(&addr) {
                     l.task.abort();
                 }
             }
@@ -286,7 +299,7 @@ impl Client {
             core: Mutex::new(core),
             udp4,
             udp6,
-            links: Mutex::new(HashMap::new()),
+            links: Mutex::new(Links::default()),
             wakers: Mutex::new(HashMap::new()),
             kick: Notify::new(),
             established: watch::Sender::new(0),
@@ -353,7 +366,9 @@ impl Drop for Client {
         for t in &self.tasks {
             t.abort();
         }
-        for (_, l) in lock(&self.sh.links).drain() {
+        let mut links = lock(&self.sh.links);
+        links.closed = true;
+        for (_, l) in links.by_addr.drain() {
             l.task.abort();
         }
     }
