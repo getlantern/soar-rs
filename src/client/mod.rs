@@ -337,6 +337,11 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.sh.core().close();
+        // The driver won't dispatch the close any more: wake every stream's waiters now, so
+        // Conns that outlive the Client see it closed rather than hanging.
+        for w in lock(&self.sh.wakers).values_mut() {
+            w.wake_all();
+        }
         for t in &self.tasks {
             t.abort();
         }

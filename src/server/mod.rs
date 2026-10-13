@@ -49,9 +49,11 @@ pub async fn serve(socket: UdpSocket, cfg: ServerConfig, dial: DialPolicy) -> io
         timer: Notify::new(),
         dial,
     });
-    let timer = tokio::spawn(run_timer(sh.clone()));
+    // However serve ends, including by being dropped, stop the timer and end every session, so
+    // relays let go of their destinations and nothing keeps the socket.
+    let _stop = Stop(sh.clone(), tokio::spawn(run_timer(sh.clone())));
     let mut buf = vec![0u8; 4096];
-    let result = loop {
+    loop {
         match sh.socket.recv_from(&mut buf).await {
             Ok((n, from)) => sh.run(|c, now| c.handle(&buf[..n], from, now)).await,
             // ICMP errors from earlier sends surface here on some platforms.
@@ -60,11 +62,27 @@ pub async fn serve(socket: UdpSocket, cfg: ServerConfig, dial: DialPolicy) -> io
                     e.kind(),
                     io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
                 ) => {}
-            Err(e) => break Err(e),
+            Err(e) => return Err(e),
         }
-    };
-    timer.abort();
-    result
+    }
+}
+
+/// Ends a server when dropped.
+struct Stop(Arc<Shared>, tokio::task::JoinHandle<()>);
+
+impl Drop for Stop {
+    fn drop(&mut self) {
+        self.1.abort();
+        let events: Vec<ServerEvent> = {
+            let mut c = self.0.lock();
+            c.close_all();
+            std::iter::from_fn(|| c.poll_event()).collect()
+        };
+        // Aborted streams wake their relays, which then close their destinations.
+        for e in events {
+            self.0.dispatch(e);
+        }
+    }
 }
 
 async fn run_timer(sh: Arc<Shared>) {
@@ -148,7 +166,7 @@ impl Shared {
 }
 
 /// How one direction of a relay ended badly.
-enum Stop {
+enum End {
     /// The client stopped reading the stream.
     Gone,
     Failed,
@@ -206,12 +224,23 @@ async fn serve_stream(sh: &Arc<Shared>, k: StreamKey, w: &Wake) {
         let mut buf = vec![0u8; 16 << 10];
         loop {
             match sh.read(k, w, &mut buf).await {
-                Read::Data(n) => wr.write_all(&buf[..n]).await.map_err(|_| Stop::Failed)?,
+                Read::Data(n) => {
+                    // A destination that stops reading would block this forever: give up when
+                    // the stream is aborted or its session ends, as the downstream side does.
+                    let write = wr.write_all(&buf[..n]);
+                    tokio::pin!(write);
+                    loop {
+                        tokio::select! {
+                            r = &mut write => break r.map_err(|_| End::Failed)?,
+                            _ = w.read.notified() => if sh.lock().aborted(k) { return Err(End::Failed) },
+                        }
+                    }
+                }
                 Read::Eof => {
                     let _ = wr.shutdown().await;
                     return Ok(());
                 }
-                _ => return Err(Stop::Failed),
+                _ => return Err(End::Failed),
             }
         }
     };
@@ -220,8 +249,8 @@ async fn serve_stream(sh: &Arc<Shared>, k: StreamKey, w: &Wake) {
         loop {
             let n = loop {
                 tokio::select! {
-                    r = rd.read(&mut buf) => break r.map_err(|_| Stop::Failed)?,
-                    _ = w.write.notified() => if sh.lock().gone(k) { return Err(Stop::Gone) },
+                    r = rd.read(&mut buf) => break r.map_err(|_| End::Failed)?,
+                    _ = w.write.notified() => if sh.lock().gone(k) { return Err(End::Gone) },
                 }
             };
             if n == 0 {
@@ -233,7 +262,7 @@ async fn serve_stream(sh: &Arc<Shared>, k: StreamKey, w: &Wake) {
                 match sh.run(|c, now| c.write(k, &buf[off..n], now)).await {
                     Ok(0) => w.write.notified().await,
                     Ok(m) => off += m,
-                    Err(_) => return Err(Stop::Gone),
+                    Err(_) => return Err(End::Gone),
                 }
             }
         }
@@ -250,7 +279,7 @@ async fn serve_stream(sh: &Arc<Shared>, k: StreamKey, w: &Wake) {
                 down_done = true;
                 // Once the client stops reading, the destination closes as soon as the upload
                 // has been delivered; any other failure closes it at once.
-                if let Err(Stop::Failed) = r { return }
+                if let Err(End::Failed) = r { return }
             }
         }
     }

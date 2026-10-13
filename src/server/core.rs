@@ -383,6 +383,14 @@ impl ServerCore {
         }
     }
 
+    /// Ends every session, aborting their streams.
+    pub fn close_all(&mut self) {
+        let sids: Vec<u16> = self.sessions.keys().copied().collect();
+        for sid in sids {
+            self.remove_session(sid);
+        }
+    }
+
     fn remove_session(&mut self, sid: u16) {
         if let Some(mut ss) = self.sessions.remove(&sid) {
             ss.s.close("soar: closed");
