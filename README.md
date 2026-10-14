@@ -4,7 +4,8 @@ A wire-compatible Rust implementation of [Soar](https://github.com/getlantern/so
 for networks that censor everything except DNS. Its client and server interoperate with the Go
 ones.
 
-The protocol is specified in Soar's [SPEC.md](https://github.com/getlantern/soar/blob/main/SPEC.md).
+The protocol is specified in Soar's [SPEC.md](https://github.com/getlantern/soar/blob/main/SPEC.md),
+and described at [soar.lantern.io](https://soar.lantern.io).
 This crate is tested against the reference implementation's wire test vectors, in
 [`testdata/vectors.json`](testdata/vectors.json). They're copied from `getlantern/soar` at the
 commit pinned in [`testdata/VECTORS_REF`](testdata/VECTORS_REF), and CI checks that the copy
@@ -29,7 +30,8 @@ Early work. The protocol itself is still pre-release.
   `AsyncWrite`. The `soar-client` binary forwards local TCP connections through the tunnel.
 - [x] **Interop CI**, both ways: the Go client against the Rust server (`interop/run.sh`), and the
   Rust client against the Go server (`interop/run-reverse.sh`).
-- [ ] **A `dnsbench` contender** in `getlantern/soar/bench`.
+- [x] **A `dnsbench` contender** in `getlantern/soar/bench`, so the Rust implementation is
+  benchmarked alongside Soar's Go one and the other DNS tunnels.
 
 ## Running the server
 
