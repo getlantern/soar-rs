@@ -198,7 +198,13 @@ async fn serve_stream(sh: &Arc<Shared>, k: StreamKey, w: &Wake) {
         String::from_utf8(addr).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
     })
     .await;
-    let Ok(Ok(addr)) = addr else { return };
+    let Ok(Ok(addr)) = addr else {
+        // No usable destination (malformed, or none within 30 s): refuse the stream as
+        // unreachable. A graceful close would end in a FIN and then a "stop sending" RESET,
+        // which tells a client waiting for OPENED nothing, so it would wait forever.
+        sh.run(|c, now| c.refuse(k, now)).await;
+        return;
+    };
 
     // A stream the client aborted is never dialed, and an abort cancels a pending dial. A RESET
     // after the client's FIN isn't an abort: it means "I won't read the reply", so the upload is
@@ -282,5 +288,80 @@ async fn serve_stream(sh: &Arc<Shared>, k: StreamKey, w: &Wake) {
                 if let Err(End::Failed) = r { return }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto;
+    use crate::dns::{self, Zone};
+    use crate::frames::{self, Frame};
+    use ed25519_dalek::SigningKey;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    /// A stream whose destination prefix is malformed is refused with RESET_STREAM code 1, so a
+    /// client waiting for OPENED gets an answer instead of waiting forever.
+    #[tokio::test]
+    async fn malformed_destination_is_refused() {
+        let key = SigningKey::from_bytes(&[5; 32]);
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let dial = DialPolicy {
+            allow_ports: None,
+            allow_private: true,
+            ..DialPolicy::default()
+        };
+        tokio::spawn(serve(
+            sock,
+            ServerConfig::new("t.example.com", key.clone()),
+            dial,
+        ));
+        let z = Zone::parse("t.example.com").unwrap();
+        let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut txn = 0u16;
+        let mut ask = async |payload: &[u8]| -> Option<dns::Answer> {
+            txn += 1;
+            let mut q = Vec::new();
+            dns::put_query(&mut q, txn, payload, &z, dns::TYPE_TXT, dns::EDNS_SIZE);
+            c.send_to(&q, addr).await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(2), c.recv(&mut buf))
+                .await
+                .ok()?
+                .ok()?;
+            dns::parse_answer(&buf[..n]).ok()
+        };
+        // Handshake by hand.
+        let eph = StaticSecret::from([6; 32]);
+        let mut hello = vec![0, 0];
+        hello.extend_from_slice(PublicKey::from(&eph).as_bytes());
+        let reply = ask(&hello).await.expect("hello reply");
+        let s = crypto::client_finish(&key.verifying_key(), &eph, &reply.payload).unwrap();
+        // Open stream 0 with a zero-length destination, then poll until the server reacts.
+        let mut first = vec![0x50];
+        frames::put_stream(&mut first, 0, 0, &[0], false, true);
+        let (mut up_pn, mut largest) = (0u64, None::<u64>);
+        let mut next = Some(first);
+        for _ in 0..8 {
+            let plain = next
+                .take()
+                .unwrap_or_else(|| vec![0x50, frames::PING, 0, 0, 0]);
+            let Some(a) = ask(&s.up.seal_up(s.sid, up_pn, &plain)).await else {
+                continue;
+            };
+            let dec = |t| crypto::decode_pn(largest.unwrap_or(0), largest.is_some(), t);
+            if let Ok((pn, down)) = s.down.open_down(&a.payload, up_pn, dec) {
+                largest = Some(largest.map_or(pn, |l: u64| l.max(pn)));
+                for f in frames::parse(&down[2..]).unwrap() {
+                    if let Frame::ResetStream { id: 0, code } = f {
+                        assert_eq!(code, 1, "refused as unreachable, not closed gracefully");
+                        return;
+                    }
+                }
+            }
+            up_pn += 1;
+        }
+        panic!("the server never refused the malformed stream");
     }
 }
