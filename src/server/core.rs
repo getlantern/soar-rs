@@ -894,6 +894,14 @@ mod tests {
     }
 
     #[test]
+    fn zero_max_streams_means_the_default() {
+        let mut cfg = ServerConfig::new(ZONE, SigningKey::from_bytes(&[7; 32]));
+        cfg.max_streams = 0;
+        let core = ServerCore::new(cfg, Instant::now()).unwrap();
+        assert_eq!(core.cfg.max_streams, 128);
+    }
+
+    #[test]
     fn data_query_is_answered_at_once_and_opens_a_stream() {
         let t0 = Instant::now();
         let (mut core, z, s) = setup(t0);

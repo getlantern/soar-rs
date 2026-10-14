@@ -960,7 +960,8 @@ impl ClientCore {
         if busy {
             let ids: Vec<u64> = self.paths.iter().map(|p| p.id).collect();
             for id in ids {
-                if self.live_queries() >= self.cfg.max_inflight {
+                if self.live_queries() >= self.cfg.max_inflight || self.pending.len() >= MAX_PENDING
+                {
                     break;
                 }
                 let p = self.paths.iter().find(|p| p.id == id).expect("listed");
@@ -1023,7 +1024,10 @@ impl ClientCore {
             self.paths.iter().map(|p| (p.last_hello, p.id)).collect();
         order.sort();
         for (_, id) in order {
-            if sent >= MAX_HELLO_PATHS || self.live_queries() >= self.cfg.max_inflight {
+            if sent >= MAX_HELLO_PATHS
+                || self.live_queries() >= self.cfg.max_inflight
+                || self.pending.len() >= MAX_PENDING
+            {
                 break;
             }
             let p = self.path_mut(id).expect("listed");
@@ -1068,6 +1072,11 @@ impl ClientCore {
     }
 
     fn send_data(&mut self, id: u64, now: Instant, allow_dup: bool) {
+        // Checked here so every data send (fill, probes of unverified paths, the tail copy)
+        // respects the ceiling.
+        if self.pending.len() >= MAX_PENDING {
+            return;
+        }
         let (max_qname, hold) = (self.cfg.max_qname, self.cfg.hold);
         let p = self.paths.iter_mut().find(|p| p.id == id).expect("listed");
         let mut name_len = p.name_len;
@@ -1693,6 +1702,30 @@ mod tests {
         c.connect();
         c.tick(now);
         assert!(c.take_transmits().is_empty());
+    }
+
+    /// Hellos to many resolvers, starting one below the ceiling, stop at it.
+    #[test]
+    fn max_pending_holds_for_hellos() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let resolvers: Vec<String> = (1..=20).map(|i| format!("192.0.2.{i}:53")).collect();
+        let resolvers: Vec<&str> = resolvers.iter().map(String::as_str).collect();
+        let mut c =
+            ClientCore::new(ClientConfig::new("t.example.com", key, &resolvers), now).unwrap();
+        for txn in 0..(MAX_PENDING - 1) as u16 {
+            let mut q = c.query(c.paths[0].id, 0, now);
+            q.expired = true;
+            q.deadline = now + Duration::from_secs(60);
+            c.pending.insert(txn, q);
+        }
+        c.connect();
+        c.tick(now);
+        assert!(
+            c.pending.len() <= MAX_PENDING,
+            "{} pending",
+            c.pending.len()
+        );
     }
 
     #[test]
