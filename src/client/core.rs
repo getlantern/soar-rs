@@ -93,6 +93,12 @@ impl ClientConfig {
     }
 }
 
+/// The most queries a client may have in flight, whatever it's configured with. With expired
+/// queries kept for LATE_GRACE as well, pending queries stay far below the 65,536 DNS IDs.
+const MAX_INFLIGHT_CAP: usize = 1024;
+/// A hard ceiling on pending queries (live and expired), so a free DNS ID always exists and
+/// picking one at random always terminates.
+const MAX_PENDING: usize = 60_000;
 /// Answer limit = 512 + 48*class.
 const LIMIT_CLASSES: usize = 16;
 const OUTCOME_WINDOW: usize = 20;
@@ -505,7 +511,7 @@ impl ClientCore {
         let or = |v: usize, d: usize| if v == 0 { d } else { v };
         cfg.safe_qname = or(cfg.safe_qname, d.safe_qname);
         cfg.max_qname = or(cfg.max_qname, d.max_qname);
-        cfg.max_inflight = or(cfg.max_inflight, d.max_inflight);
+        cfg.max_inflight = or(cfg.max_inflight, d.max_inflight).min(MAX_INFLIGHT_CAP);
         cfg.max_path_window = or(cfg.max_path_window, d.max_path_window);
         cfg.max_answer = or(cfg.max_answer, d.max_answer);
         cfg.send_buffer = or(cfg.send_buffer, d.send_buffer);
@@ -936,6 +942,9 @@ impl ClientCore {
     }
 
     fn fill(&mut self, now: Instant) {
+        if self.pending.len() >= MAX_PENDING {
+            return; // no DNS ID to spare until expired queries age out
+        }
         let Some(cs) = &self.sess else { return };
         let Some(s) = &cs.s else {
             return self.send_hellos(now);
@@ -964,7 +973,7 @@ impl ClientCore {
                 inflight += 1;
                 polls += usize::from(!q.scout);
             }
-            if inflight >= self.cfg.max_inflight {
+            if inflight >= self.cfg.max_inflight || self.pending.len() >= MAX_PENDING {
                 return;
             }
             let cs = self.sess.as_ref().expect("checked");
@@ -1662,6 +1671,26 @@ mod tests {
             1,
             "the tail copy exceeded max_inflight"
         );
+    }
+
+    #[test]
+    fn max_inflight_is_capped_and_a_full_id_space_stops_sending() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
+        cfg.max_inflight = 1_000_000;
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        assert_eq!(c.cfg.max_inflight, MAX_INFLIGHT_CAP);
+        // Pending queries at the ceiling: tick returns without trying to pick a DNS ID.
+        for txn in 0..MAX_PENDING as u16 {
+            let mut q = c.query(c.paths[0].id, 0, now);
+            q.expired = true;
+            q.deadline = now + Duration::from_secs(60);
+            c.pending.insert(txn, q);
+        }
+        c.connect();
+        c.tick(now);
+        assert!(c.take_transmits().is_empty());
     }
 
     #[test]

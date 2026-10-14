@@ -450,16 +450,33 @@ impl Conn {
             wait.as_mut().enable();
             {
                 let mut c = self.sh.core();
-                if c.stream_opened(self.r) {
-                    return Ok(());
-                }
-                if c.stream_aborted(self.r) || c.established() != Some(self.r.session) {
-                    return Err(stream_err(StreamError::Unreachable));
+                let opened = c.stream_opened(self.r);
+                let aborted = c.stream_aborted(self.r);
+                if let Some(r) = opened_result(opened, aborted, c.established(), self.r.session) {
+                    return r.map_err(stream_err);
                 }
             }
             wait.await;
         }
     }
+}
+
+/// What a waiting opened() reports, if anything yet. The session is checked before the stream:
+/// when a session ends its streams are gone too, and that's SessionClosed, not a destination
+/// that refused. Unreachable is a stream reset while its session is still up.
+fn opened_result(
+    opened: bool,
+    aborted: bool,
+    live_session: Option<u64>,
+    session: u64,
+) -> Option<Result<(), StreamError>> {
+    if opened {
+        return Some(Ok(()));
+    }
+    if live_session != Some(session) {
+        return Some(Err(StreamError::SessionClosed));
+    }
+    aborted.then_some(Err(StreamError::Unreachable))
 }
 
 impl AsyncRead for Conn {
@@ -527,5 +544,33 @@ impl Drop for Conn {
         self.sh.core().close_stream(self.r);
         lock(&self.sh.wakers).remove(&self.r);
         self.sh.kick.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opened_reports_a_closed_session_as_such() {
+        assert_eq!(opened_result(true, false, Some(1), 1), Some(Ok(())));
+        assert_eq!(
+            opened_result(false, false, Some(1), 1),
+            None,
+            "still waiting"
+        );
+        assert_eq!(
+            opened_result(false, true, Some(1), 1),
+            Some(Err(StreamError::Unreachable))
+        );
+        // The session ended (its streams with it): not a refusal by the destination.
+        assert_eq!(
+            opened_result(false, true, None, 1),
+            Some(Err(StreamError::SessionClosed))
+        );
+        assert_eq!(
+            opened_result(false, true, Some(2), 1),
+            Some(Err(StreamError::SessionClosed))
+        );
     }
 }
