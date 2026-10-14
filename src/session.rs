@@ -129,8 +129,19 @@ impl StreamSlots {
         false
     }
 
+    /// Gives a slot back. Saturates at zero: an accounting slip must never wrap the count,
+    /// which would refuse every stream in every session from then on.
     fn release(&self) {
-        self.used.fetch_sub(1, Ordering::AcqRel);
+        let mut n = self.used.load(Ordering::Acquire);
+        while n > 0 {
+            match self
+                .used
+                .compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(now) => n = now,
+            }
+        }
     }
 
     pub fn used(&self) -> usize {
@@ -283,6 +294,10 @@ impl Session {
         st.spending.add(0, st.sbuf.len() as u64);
         self.streams.insert(id, st);
         self.advertise(id);
+        // Advertising can overflow the control queue and end the session.
+        if self.closed {
+            return Err(StreamError::SessionClosed);
+        }
         self.rr.push_back(id);
         Ok(id)
     }
@@ -303,8 +318,10 @@ impl Session {
                 val: 0,
             });
         }
-        self.streams.remove(&id);
-        if !self.client
+        // The RESET above can overflow the control queue and end the session, which already
+        // released every stream's slot: release this one only if it's still here to remove.
+        if self.streams.remove(&id).is_some()
+            && !self.client
             && let Some(s) = &self.slots
         {
             s.release();
@@ -503,6 +520,11 @@ impl Session {
             Stream::new(self.cfg.stream_window, self.cfg.send_buffer),
         );
         self.advertise(id);
+        // Advertising can overflow the control queue and end the session, taking this stream
+        // with it: there's nothing to accept.
+        if self.closed {
+            return None;
+        }
         self.rr.push_back(id);
         self.events.push_back(Event::Accepted(id));
         self.streams.get_mut(&id)
@@ -1087,6 +1109,36 @@ mod tests {
             }
         }
         assert!(s.is_closed(), "the queue silently dropped frames instead");
+    }
+
+    /// A RESET that overflows the control queue ends the session, which releases every stream's
+    /// slot in the cross-session cap. The stream being removed must not be released again.
+    #[test]
+    fn overflow_while_removing_a_stream_releases_its_slot_once() {
+        let now = Instant::now();
+        let (_, mut s) = pair();
+        let slots = StreamSlots::new(10);
+        assert!(slots.take()); // another session's stream holds a slot throughout
+        s.set_slots(slots.clone());
+        let mut p = Vec::new();
+        frames::put_stream(&mut p, 0, 0, b"\x03a:1", false, true);
+        s.receive(0, &p, now);
+        assert_eq!(slots.used(), 2);
+        // The control queue is full, and the stream is about to be removed with a RESET (we
+        // stopped reading before the peer finished, and our sending was aborted).
+        while s.ctrl_q.len() < MAX_CTRL_QUEUE {
+            let id = s.ctrl_q.len() as u64 + 100;
+            s.ctrl_q.push_back(Ctrl {
+                typ: frames::OPENED,
+                id,
+                val: 0,
+            });
+        }
+        let st = s.streams.get_mut(&0).unwrap();
+        (st.rclosed, st.saborted) = (true, true);
+        s.release_stream(0);
+        assert!(s.is_closed(), "the RESET overflowed the queue");
+        assert_eq!(slots.used(), 1, "the stream's slot was released twice");
     }
 
     #[test]
