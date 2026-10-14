@@ -16,7 +16,7 @@ use super::discovery::{Discovery, parse_resolver};
 use crate::crypto::{self, MIN_PLAIN, PUB_LEN, SIG_LEN, TAG_LEN};
 use crate::dns::{self, Zone};
 use crate::frames;
-use crate::session::{Event, Read, Session, StreamConfig};
+use crate::session::{Event, MAX_STREAMS_CAP, Read, Session, StreamConfig};
 use crate::stream::StreamError;
 
 /// When to use TCP/53 paths.
@@ -515,7 +515,7 @@ impl ClientCore {
         cfg.max_path_window = or(cfg.max_path_window, d.max_path_window);
         cfg.max_answer = or(cfg.max_answer, d.max_answer);
         cfg.send_buffer = or(cfg.send_buffer, d.send_buffer);
-        cfg.max_streams = or(cfg.max_streams, d.max_streams);
+        cfg.max_streams = or(cfg.max_streams, d.max_streams).min(MAX_STREAMS_CAP);
         if cfg.stream_window == 0 {
             cfg.stream_window = d.stream_window;
         }
@@ -1691,6 +1691,70 @@ mod tests {
         c.connect();
         c.tick(now);
         assert!(c.take_transmits().is_empty());
+    }
+
+    #[test]
+    fn max_streams_is_capped() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
+        cfg.max_streams = 100_000;
+        let c = ClientCore::new(cfg, now).unwrap();
+        assert_eq!(c.cfg.max_streams, MAX_STREAMS_CAP);
+    }
+
+    /// An authenticated answer restarts the liveness clock while other queries are still out,
+    /// so if every path then dies the session is still presumed lost.
+    #[test]
+    fn liveness_clock_restarts_with_queries_out() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53", "192.0.2.2:53"]);
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        for p in &mut c.paths {
+            p.verified = true;
+        }
+        let pc = || crate::crypto::PacketCipher {
+            key: [1; 32],
+            iv: [2; 12],
+            hp: [3; 32],
+        };
+        let scfg = StreamConfig {
+            stream_window: 1 << 16,
+            send_buffer: 1 << 16,
+            max_streams: 4,
+        };
+        c.sess = Some(ClientSession {
+            generation: 1,
+            eph: StaticSecret::from([4; 32]),
+            s: Some(Session::new(true, scfg, pc(), pc())),
+            sid: 1,
+            backlog: 0,
+            last_auth: Some(now),
+            unanswered: None,
+        });
+        let r = c.open_stream("a:1").unwrap();
+        c.write(r, b"GET").unwrap();
+        c.tick(now);
+        let out = c.take_transmits();
+        assert!(out.len() >= 2, "want two queries out, have {}", out.len());
+        // The server's answer to the first, sealed with the session's keys.
+        let q = dns::parse_query(&out[0].msg, &c.zone).unwrap();
+        let up_pn = c.pending[&q.txn].pn;
+        let payload = pc().seal_down(0, up_pn, &[0, 0, frames::PING, 0, 0, 0]);
+        let mut msg = Vec::new();
+        dns::put_answer(&mut msg, &q, dns::RCODE_OK, Some(&payload));
+        c.handle_answer(&msg, now);
+        let cs = c.sess.as_ref().unwrap();
+        assert!(
+            cs.unanswered.is_some(),
+            "the liveness clock stopped with a query still out"
+        );
+        c.check_liveness(now + DEAD_SESSION_AFTER + Duration::from_secs(1));
+        assert!(
+            c.established().is_none(),
+            "the session wasn't presumed lost"
+        );
     }
 
     #[test]
