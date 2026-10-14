@@ -1644,17 +1644,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tail_copy_respects_max_inflight() {
-        let now = Instant::now();
+    /// A client with an established session and a short request to send, whose tail would go
+    /// out twice.
+    fn client_with_short_request(now: Instant, max_inflight: usize) -> ClientCore {
         let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
         let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53", "192.0.2.2:53"]);
-        cfg.max_inflight = 1;
+        cfg.max_inflight = max_inflight;
         let mut c = ClientCore::new(cfg, now).unwrap();
         for p in &mut c.paths {
             p.verified = true;
         }
-        // An established session with a short request to send, whose tail would go out twice.
         let pc = || crate::crypto::PacketCipher {
             key: [1; 32],
             iv: [2; 12],
@@ -1676,12 +1675,36 @@ mod tests {
         });
         let r = c.open_stream("a:1").unwrap();
         c.write(r, b"GET").unwrap();
+        c
+    }
+
+    #[test]
+    fn tail_copy_respects_max_inflight() {
+        let now = Instant::now();
+        let mut c = client_with_short_request(now, 1);
         c.tick(now);
         assert_eq!(
             c.take_transmits().len(),
             1,
             "the tail copy exceeded max_inflight"
         );
+    }
+
+    /// One below MAX_PENDING, the request's first copy takes the last slot and the tail copy
+    /// must not go past it.
+    #[test]
+    fn tail_copy_respects_max_pending() {
+        let now = Instant::now();
+        let mut c = client_with_short_request(now, 128);
+        for txn in 0..(MAX_PENDING - 1) as u16 {
+            let mut q = c.query(c.paths[0].id, 0, now);
+            q.expired = true;
+            q.deadline = now + Duration::from_secs(60);
+            c.pending.insert(txn, q);
+        }
+        c.tick(now);
+        assert_eq!(c.pending.len(), MAX_PENDING);
+        assert_eq!(c.take_transmits().len(), 1);
     }
 
     #[test]
