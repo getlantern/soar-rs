@@ -2,8 +2,6 @@
 
 use crate::Error;
 
-pub const MAX: u64 = (1 << 62) - 1;
-
 pub fn len(v: u64) -> usize {
     match v {
         0..0x40 => 1,
