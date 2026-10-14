@@ -22,7 +22,8 @@ pub struct StreamConfig {
     pub max_streams: usize,
 }
 
-/// A peer can't make us queue control frames without bound; lost ones are re-sent anyway.
+/// A peer can't make us queue control frames without bound: past this many queued, the session
+/// ends (see queue_ctrl), since dropping one could stall a stream for good.
 const MAX_CTRL_QUEUE: usize = 1024;
 /// How far below the largest received packet number duplicates are still recognized.
 const REPLAY_WINDOW: u64 = 1 << 14;
@@ -236,9 +237,20 @@ impl Session {
             q.val = q.val.max(c.val);
             return;
         }
-        if self.ctrl_q.len() < MAX_CTRL_QUEUE {
-            self.ctrl_q.push_back(c);
+        // The same frame already waiting (a second RESET or OPENED for a stream) adds nothing.
+        if self.ctrl_q.contains(&c) {
+            return;
         }
+        // Callers update their state as if the frame will go out (a read raises rmax before
+        // its MAX_STREAM_DATA), so dropping one would stall a stream for good. Legitimate
+        // traffic stays far below the cap: grants coalesce per stream, and each stream has
+        // one OPENED and one RESET at most. Only a misbehaving peer fills it (say, opening
+        // stream after stream past the limit, each refused with a RESET), so end the session.
+        if self.ctrl_q.len() >= MAX_CTRL_QUEUE {
+            self.close("soar: control frame queue overflow");
+            return;
+        }
+        self.ctrl_q.push_back(c);
     }
 
     /// Sends the receive window if it's larger than the initial one.
@@ -1058,6 +1070,23 @@ mod tests {
             "the FIN arrives, not a RESET"
         );
         assert!(!s.stream_aborted(0));
+    }
+
+    #[test]
+    fn control_queue_overflow_ends_the_session_instead_of_dropping_frames() {
+        let now = Instant::now();
+        let (_, mut s) = pair();
+        // The server is at its stream limit (4); the peer keeps opening streams anyway, and
+        // each refusal queues a RESET.
+        for id in 0..2000u64 {
+            let mut p = Vec::new();
+            frames::put_stream(&mut p, id, 0, b"x", false, true);
+            s.receive(id, &p, now);
+            if s.is_closed() {
+                break;
+            }
+        }
+        assert!(s.is_closed(), "the queue silently dropped frames instead");
     }
 
     #[test]
