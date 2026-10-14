@@ -16,7 +16,7 @@ use super::discovery::{Discovery, parse_resolver};
 use crate::crypto::{self, MIN_PLAIN, PUB_LEN, SIG_LEN, TAG_LEN};
 use crate::dns::{self, Zone};
 use crate::frames;
-use crate::session::{Event, Read, Session, StreamConfig};
+use crate::session::{Event, MAX_STREAMS_CAP, Read, Session, StreamConfig};
 use crate::stream::StreamError;
 
 /// When to use TCP/53 paths.
@@ -50,7 +50,8 @@ pub struct ClientConfig {
     pub max_qname: usize,
     /// How long the server may hold an idle poll.
     pub hold: Duration,
-    /// Queries outstanding across all paths.
+    /// Queries outstanding across all paths. At most 1,024, which keeps pending queries well
+    /// inside the DNS ID space.
     pub max_inflight: usize,
     /// Queries outstanding on one path.
     pub max_path_window: usize,
@@ -59,6 +60,7 @@ pub struct ClientConfig {
     pub max_answer: usize,
     pub stream_window: u64,
     pub send_buffer: usize,
+    /// Streams open at once. At most 256, so stream control frames fit the session's queue.
     pub max_streams: usize,
     pub tcp: TcpMode,
     /// Reports resolvers that only speak a stream transport: they get a TCP path from the start
@@ -515,7 +517,7 @@ impl ClientCore {
         cfg.max_path_window = or(cfg.max_path_window, d.max_path_window);
         cfg.max_answer = or(cfg.max_answer, d.max_answer);
         cfg.send_buffer = or(cfg.send_buffer, d.send_buffer);
-        cfg.max_streams = or(cfg.max_streams, d.max_streams);
+        cfg.max_streams = or(cfg.max_streams, d.max_streams).min(MAX_STREAMS_CAP);
         if cfg.stream_window == 0 {
             cfg.stream_window = d.stream_window;
         }
@@ -958,7 +960,8 @@ impl ClientCore {
         if busy {
             let ids: Vec<u64> = self.paths.iter().map(|p| p.id).collect();
             for id in ids {
-                if self.live_queries() >= self.cfg.max_inflight {
+                if self.live_queries() >= self.cfg.max_inflight || self.pending.len() >= MAX_PENDING
+                {
                     break;
                 }
                 let p = self.paths.iter().find(|p| p.id == id).expect("listed");
@@ -1021,7 +1024,10 @@ impl ClientCore {
             self.paths.iter().map(|p| (p.last_hello, p.id)).collect();
         order.sort();
         for (_, id) in order {
-            if sent >= MAX_HELLO_PATHS || self.live_queries() >= self.cfg.max_inflight {
+            if sent >= MAX_HELLO_PATHS
+                || self.live_queries() >= self.cfg.max_inflight
+                || self.pending.len() >= MAX_PENDING
+            {
                 break;
             }
             let p = self.path_mut(id).expect("listed");
@@ -1066,6 +1072,11 @@ impl ClientCore {
     }
 
     fn send_data(&mut self, id: u64, now: Instant, allow_dup: bool) {
+        // Checked here so every data send (fill, probes of unverified paths, the tail copy)
+        // respects the ceiling.
+        if self.pending.len() >= MAX_PENDING {
+            return;
+        }
         let (max_qname, hold) = (self.cfg.max_qname, self.cfg.hold);
         let p = self.paths.iter_mut().find(|p| p.id == id).expect("listed");
         let mut name_len = p.name_len;
@@ -1633,17 +1644,134 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tail_copy_respects_max_inflight() {
-        let now = Instant::now();
+    /// A client with an established session and a short request to send, whose tail would go
+    /// out twice.
+    fn client_with_short_request(now: Instant, max_inflight: usize) -> ClientCore {
         let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
         let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53", "192.0.2.2:53"]);
-        cfg.max_inflight = 1;
+        cfg.max_inflight = max_inflight;
         let mut c = ClientCore::new(cfg, now).unwrap();
         for p in &mut c.paths {
             p.verified = true;
         }
-        // An established session with a short request to send, whose tail would go out twice.
+        let pc = || crate::crypto::PacketCipher {
+            key: [1; 32],
+            iv: [2; 12],
+            hp: [3; 32],
+        };
+        let scfg = StreamConfig {
+            stream_window: 1 << 16,
+            send_buffer: 1 << 16,
+            max_streams: 4,
+        };
+        c.sess = Some(ClientSession {
+            generation: 1,
+            eph: StaticSecret::from([4; 32]),
+            s: Some(Session::new(true, scfg, pc(), pc())),
+            sid: 1,
+            backlog: 0,
+            last_auth: Some(now),
+            unanswered: None,
+        });
+        let r = c.open_stream("a:1").unwrap();
+        c.write(r, b"GET").unwrap();
+        c
+    }
+
+    #[test]
+    fn tail_copy_respects_max_inflight() {
+        let now = Instant::now();
+        let mut c = client_with_short_request(now, 1);
+        c.tick(now);
+        assert_eq!(
+            c.take_transmits().len(),
+            1,
+            "the tail copy exceeded max_inflight"
+        );
+    }
+
+    /// One below MAX_PENDING, the request's first copy takes the last slot and the tail copy
+    /// must not go past it.
+    #[test]
+    fn tail_copy_respects_max_pending() {
+        let now = Instant::now();
+        let mut c = client_with_short_request(now, 128);
+        for txn in 0..(MAX_PENDING - 1) as u16 {
+            let mut q = c.query(c.paths[0].id, 0, now);
+            q.expired = true;
+            q.deadline = now + Duration::from_secs(60);
+            c.pending.insert(txn, q);
+        }
+        c.tick(now);
+        assert_eq!(c.pending.len(), MAX_PENDING);
+        assert_eq!(c.take_transmits().len(), 1);
+    }
+
+    #[test]
+    fn max_inflight_is_capped_and_a_full_id_space_stops_sending() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
+        cfg.max_inflight = 1_000_000;
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        assert_eq!(c.cfg.max_inflight, MAX_INFLIGHT_CAP);
+        // Pending queries at the ceiling: tick returns without trying to pick a DNS ID.
+        for txn in 0..MAX_PENDING as u16 {
+            let mut q = c.query(c.paths[0].id, 0, now);
+            q.expired = true;
+            q.deadline = now + Duration::from_secs(60);
+            c.pending.insert(txn, q);
+        }
+        c.connect();
+        c.tick(now);
+        assert!(c.take_transmits().is_empty());
+    }
+
+    /// Hellos to many resolvers, starting one below the ceiling, stop at it.
+    #[test]
+    fn max_pending_holds_for_hellos() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let resolvers: Vec<String> = (1..=20).map(|i| format!("192.0.2.{i}:53")).collect();
+        let resolvers: Vec<&str> = resolvers.iter().map(String::as_str).collect();
+        let mut c =
+            ClientCore::new(ClientConfig::new("t.example.com", key, &resolvers), now).unwrap();
+        for txn in 0..(MAX_PENDING - 1) as u16 {
+            let mut q = c.query(c.paths[0].id, 0, now);
+            q.expired = true;
+            q.deadline = now + Duration::from_secs(60);
+            c.pending.insert(txn, q);
+        }
+        c.connect();
+        c.tick(now);
+        assert!(
+            c.pending.len() <= MAX_PENDING,
+            "{} pending",
+            c.pending.len()
+        );
+    }
+
+    #[test]
+    fn max_streams_is_capped() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
+        cfg.max_streams = 100_000;
+        let c = ClientCore::new(cfg, now).unwrap();
+        assert_eq!(c.cfg.max_streams, MAX_STREAMS_CAP);
+    }
+
+    /// An authenticated answer restarts the liveness clock while other queries are still out,
+    /// so if every path then dies the session is still presumed lost.
+    #[test]
+    fn liveness_clock_restarts_with_queries_out() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53", "192.0.2.2:53"]);
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        for p in &mut c.paths {
+            p.verified = true;
+        }
         let pc = || crate::crypto::PacketCipher {
             key: [1; 32],
             iv: [2; 12],
@@ -1666,31 +1794,35 @@ mod tests {
         let r = c.open_stream("a:1").unwrap();
         c.write(r, b"GET").unwrap();
         c.tick(now);
+        let out = c.take_transmits();
+        assert!(out.len() >= 2, "want two queries out, have {}", out.len());
+        // The server's answer to the first, sealed with the session's keys.
+        let q = dns::parse_query(&out[0].msg, &c.zone).unwrap();
+        let up_pn = c.pending[&q.txn].pn;
+        let payload = pc().seal_down(0, up_pn, &[0, 0, frames::PING, 0, 0, 0]);
+        let mut msg = Vec::new();
+        dns::put_answer(&mut msg, &q, dns::RCODE_OK, Some(&payload));
+        // The answer comes later than the queries went out (within their deadlines), so a
+        // clock left running from the first query can be told apart from one the answer
+        // restarted.
+        let answered = now + Duration::from_millis(500);
+        c.handle_answer(&msg, answered);
+        let cs = c.sess.as_ref().unwrap();
         assert_eq!(
-            c.take_transmits().len(),
-            1,
-            "the tail copy exceeded max_inflight"
+            cs.unanswered,
+            Some(answered),
+            "the liveness clock didn't restart at the answer"
         );
-    }
-
-    #[test]
-    fn max_inflight_is_capped_and_a_full_id_space_stops_sending() {
-        let now = Instant::now();
-        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
-        cfg.max_inflight = 1_000_000;
-        let mut c = ClientCore::new(cfg, now).unwrap();
-        assert_eq!(c.cfg.max_inflight, MAX_INFLIGHT_CAP);
-        // Pending queries at the ceiling: tick returns without trying to pick a DNS ID.
-        for txn in 0..MAX_PENDING as u16 {
-            let mut q = c.query(c.paths[0].id, 0, now);
-            q.expired = true;
-            q.deadline = now + Duration::from_secs(60);
-            c.pending.insert(txn, q);
-        }
-        c.connect();
-        c.tick(now);
-        assert!(c.take_transmits().is_empty());
+        c.check_liveness(now + DEAD_SESSION_AFTER + Duration::from_millis(100));
+        assert!(
+            c.established().is_some(),
+            "the session was presumed lost counting from before the answer"
+        );
+        c.check_liveness(answered + DEAD_SESSION_AFTER + Duration::from_secs(1));
+        assert!(
+            c.established().is_none(),
+            "the session wasn't presumed lost"
+        );
     }
 
     #[test]

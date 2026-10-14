@@ -25,6 +25,14 @@ pub struct StreamConfig {
 /// A peer can't make us queue control frames without bound: past this many queued, the session
 /// ends (see queue_ctrl), since dropping one could stall a stream for good.
 const MAX_CTRL_QUEUE: usize = 1024;
+/// Caps max_streams, client and server alike. A stream queues at most three control frames (a
+/// window grant, OPENED, RESET), so this many fit the control queue with room to spare, and only
+/// a misbehaving peer can overflow it.
+pub(crate) const MAX_STREAMS_CAP: usize = MAX_CTRL_QUEUE / 4;
+const _: () = assert!(
+    3 * MAX_STREAMS_CAP < MAX_CTRL_QUEUE,
+    "capped streams could fill the queue"
+);
 /// How far below the largest received packet number duplicates are still recognized.
 const REPLAY_WINDOW: u64 = 1 << 14;
 
@@ -1139,6 +1147,34 @@ mod tests {
         s.release_stream(0);
         assert!(s.is_closed(), "the RESET overflowed the queue");
         assert_eq!(slots.used(), 1, "the stream's slot was released twice");
+    }
+
+    /// When advertising a new peer stream overflows the control queue and ends the session, the
+    /// slot taken for it in the cross-session cap is given back exactly once.
+    #[test]
+    fn peer_stream_returns_its_slot_when_advertising_overflows() {
+        let now = Instant::now();
+        let (_, mut s) = pair();
+        let slots = StreamSlots::new(10);
+        assert!(slots.take()); // another session's stream
+        s.set_slots(slots.clone());
+        while s.ctrl_q.len() < MAX_CTRL_QUEUE {
+            let id = s.ctrl_q.len() as u64 + 100;
+            s.ctrl_q.push_back(Ctrl {
+                typ: frames::OPENED,
+                id,
+                val: 0,
+            });
+        }
+        let mut p = Vec::new();
+        frames::put_stream(&mut p, 0, 0, b"x", false, true);
+        s.receive(0, &p, now);
+        assert!(s.is_closed(), "the window grant overflowed the queue");
+        assert_eq!(
+            slots.used(),
+            1,
+            "the new stream's slot wasn't given back exactly once"
+        );
     }
 
     #[test]

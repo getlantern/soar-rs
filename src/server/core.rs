@@ -13,7 +13,7 @@ use rand_core::{OsRng, RngCore};
 use crate::crypto::{self, PUB_LEN, TAG_LEN};
 use crate::dns::{self, Query, Zone};
 use crate::ranges::RangeSet;
-use crate::session::{Event, Read, Session, StreamConfig, StreamSlots};
+use crate::session::{Event, MAX_STREAMS_CAP, Read, Session, StreamConfig, StreamSlots};
 use crate::stream::StreamError;
 
 /// Configures a tunnel server: the authoritative name server for `zone`.
@@ -37,6 +37,7 @@ pub struct ServerConfig {
     pub max_hellos_per_sec: f64,
     pub stream_window: u64,
     pub send_buffer: usize,
+    /// Streams per session. At most 256, so stream control frames fit the session's queue.
     pub max_streams: usize,
 }
 
@@ -174,8 +175,14 @@ pub struct ServerCore {
 }
 
 impl ServerCore {
-    pub fn new(cfg: ServerConfig, now: Instant) -> Result<ServerCore, crate::Error> {
+    pub fn new(mut cfg: ServerConfig, now: Instant) -> Result<ServerCore, crate::Error> {
         let zone = Zone::parse(&cfg.zone)?;
+        // Zero means the default; past the cap, legitimate streams could overflow the
+        // control queue and end a healthy session.
+        if cfg.max_streams == 0 {
+            cfg.max_streams = 128;
+        }
+        cfg.max_streams = cfg.max_streams.min(MAX_STREAMS_CAP);
         Ok(ServerCore {
             slots: StreamSlots::new(cfg.max_total_streams),
             sign_tokens: Bucket::new(200.0, 200.0, now),
@@ -876,6 +883,22 @@ mod tests {
             "{} entries",
             core.held_deadlines.len()
         );
+    }
+
+    #[test]
+    fn max_streams_is_capped() {
+        let mut cfg = ServerConfig::new(ZONE, SigningKey::from_bytes(&[7; 32]));
+        cfg.max_streams = 100_000;
+        let core = ServerCore::new(cfg, Instant::now()).unwrap();
+        assert_eq!(core.cfg.max_streams, MAX_STREAMS_CAP);
+    }
+
+    #[test]
+    fn zero_max_streams_means_the_default() {
+        let mut cfg = ServerConfig::new(ZONE, SigningKey::from_bytes(&[7; 32]));
+        cfg.max_streams = 0;
+        let core = ServerCore::new(cfg, Instant::now()).unwrap();
+        assert_eq!(core.cfg.max_streams, 128);
     }
 
     #[test]
