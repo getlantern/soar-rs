@@ -50,7 +50,8 @@ pub struct ClientConfig {
     pub max_qname: usize,
     /// How long the server may hold an idle poll.
     pub hold: Duration,
-    /// Queries outstanding across all paths.
+    /// Queries outstanding across all paths. At most 1,024, which keeps pending queries well
+    /// inside the DNS ID space.
     pub max_inflight: usize,
     /// Queries outstanding on one path.
     pub max_path_window: usize,
@@ -59,6 +60,7 @@ pub struct ClientConfig {
     pub max_answer: usize,
     pub stream_window: u64,
     pub send_buffer: usize,
+    /// Streams open at once. At most 256, so stream control frames fit the session's queue.
     pub max_streams: usize,
     pub tcp: TcpMode,
     /// Reports resolvers that only speak a stream transport: they get a TCP path from the start

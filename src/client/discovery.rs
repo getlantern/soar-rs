@@ -49,7 +49,9 @@ pub struct Discovery {
     /// How many addresses to sample from the country's bundled ranges once the lists run out. Off
     /// by default: probing many in-country addresses is a visible pattern.
     pub sample_ranges: usize,
-    /// Stop adding candidates once this many paths are verified.
+    /// Stop adding candidates once this many paths are healthy: verified and working now. A
+    /// verified path that's unusable or on a run of losses doesn't count, so discovery resumes
+    /// when resolvers that worked get blocked.
     pub want: usize,
     /// Unverified candidates probed at once.
     pub concurrency: usize,

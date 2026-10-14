@@ -37,6 +37,7 @@ pub struct ServerConfig {
     pub max_hellos_per_sec: f64,
     pub stream_window: u64,
     pub send_buffer: usize,
+    /// Streams per session. At most 256, so stream control frames fit the session's queue.
     pub max_streams: usize,
 }
 
