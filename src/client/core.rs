@@ -1802,13 +1802,23 @@ mod tests {
         let payload = pc().seal_down(0, up_pn, &[0, 0, frames::PING, 0, 0, 0]);
         let mut msg = Vec::new();
         dns::put_answer(&mut msg, &q, dns::RCODE_OK, Some(&payload));
-        c.handle_answer(&msg, now);
+        // The answer comes later than the queries went out (within their deadlines), so a
+        // clock left running from the first query can be told apart from one the answer
+        // restarted.
+        let answered = now + Duration::from_millis(500);
+        c.handle_answer(&msg, answered);
         let cs = c.sess.as_ref().unwrap();
-        assert!(
-            cs.unanswered.is_some(),
-            "the liveness clock stopped with a query still out"
+        assert_eq!(
+            cs.unanswered,
+            Some(answered),
+            "the liveness clock didn't restart at the answer"
         );
-        c.check_liveness(now + DEAD_SESSION_AFTER + Duration::from_secs(1));
+        c.check_liveness(now + DEAD_SESSION_AFTER + Duration::from_millis(100));
+        assert!(
+            c.established().is_some(),
+            "the session was presumed lost counting from before the answer"
+        );
+        c.check_liveness(answered + DEAD_SESSION_AFTER + Duration::from_secs(1));
         assert!(
             c.established().is_none(),
             "the session wasn't presumed lost"
