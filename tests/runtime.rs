@@ -126,3 +126,51 @@ async fn zero_length_read_completes_at_once() {
         .expect("a zero-length read waited for data");
     assert_eq!(n.unwrap(), 0);
 }
+
+/// A client with no resolver and nothing for discovery to try could never connect: refuse it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_with_no_way_to_reach_a_resolver_is_refused() {
+    let mut cfg = ClientConfig::new(ZONE, key().verifying_key(), &[]);
+    cfg.discovery.enabled = true;
+    cfg.discovery.no_bundled = true; // and no candidates or cache
+    assert!(Client::new(cfg).await.is_err());
+}
+
+/// A cache that records what it stores, slowly, so a shutdown that doesn't wait loses the race.
+struct SlowCache(std::sync::Mutex<Vec<Vec<String>>>);
+
+impl soar::client::ResolverCache for SlowCache {
+    fn load(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn store(&self, resolvers: &[String]) {
+        std::thread::sleep(Duration::from_millis(300));
+        self.0.lock().unwrap().push(resolvers.to_vec());
+    }
+}
+
+/// close() returns only once the resolvers queued for the cache are stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_waits_for_the_cache() {
+    let (server, _srv) = start_server().await;
+    let quiet = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let quiet_addr = quiet.local_addr().unwrap().to_string();
+    let cache = std::sync::Arc::new(SlowCache(std::sync::Mutex::new(Vec::new())));
+    let mut cfg = ClientConfig::new(ZONE, key().verifying_key(), &[]);
+    cfg.tcp = TcpMode::Off;
+    cfg.discovery.enabled = true;
+    cfg.discovery.no_bundled = true;
+    cfg.discovery.candidates = vec![server.clone()];
+    cfg.discovery.cache = Some(cache.clone());
+    let c = Client::new(cfg).await.unwrap();
+    // Verifying the server's path queues it for the cache.
+    let conn = c.connect_opened(&quiet_addr).await.unwrap();
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    c.close().await;
+    let stored = cache.0.lock().unwrap().clone();
+    assert!(
+        stored.iter().any(|s| s.contains(&server)),
+        "the verified resolver wasn't stored: {stored:?}"
+    );
+}

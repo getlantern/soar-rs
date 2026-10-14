@@ -566,6 +566,11 @@ impl ClientCore {
         }
     }
 
+    /// Whether discovery has candidates it hasn't tried yet.
+    pub fn has_candidates(&self) -> bool {
+        self.cand_idx < self.cands.len()
+    }
+
     /// How many resolver paths the client has.
     pub fn path_count(&self) -> usize {
         self.paths.len()

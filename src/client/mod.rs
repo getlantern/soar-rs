@@ -272,6 +272,8 @@ async fn serve_link(sh: &Arc<Shared>, conn: TcpStream, rx: &mut mpsc::Receiver<V
 pub struct Client {
     sh: Arc<Shared>,
     tasks: Vec<JoinHandle<()>>,
+    /// The resolver-cache writer: Drop leaves it to drain on its own; close() waits for it.
+    cache_task: Option<JoinHandle<()>>,
 }
 
 impl Client {
@@ -291,25 +293,29 @@ impl Client {
         let udp6 = UdpSocket::bind("[::]:0").await.ok();
         if udp6.is_none() {
             core.disable_udp6(Instant::now());
-            if core.path_count() == 0 && !discovery_enabled {
-                return Err(io::Error::other(
-                    "soar: no usable resolvers (IPv6 resolvers, no IPv6 socket, TCP off)",
-                ));
-            }
+        }
+        // With no path and nothing for discovery to try, the client could never connect.
+        if core.path_count() == 0 && !core.has_candidates() {
+            return Err(io::Error::other(if discovery_enabled {
+                "soar: no usable resolvers, and discovery found no candidates"
+            } else {
+                "soar: no usable resolvers (IPv6 resolvers, no IPv6 socket, TCP off)"
+            }));
         }
         let mut tasks = Vec::new();
+        let mut cache_task = None;
         let cache_tx = cache.map(|cache| {
             // One task stores snapshots in order, so a cache needn't be safe for concurrent use
             // and an older snapshot never lands last.
             // It isn't aborted on Drop, so a snapshot queued just before shutdown is still stored:
             // Drop closes the channel instead, and the writer exits once it has drained it.
             let (tx, mut rx) = mpsc::unbounded_channel::<Vec<String>>();
-            tokio::spawn(async move {
+            cache_task = Some(tokio::spawn(async move {
                 while let Some(good) = rx.recv().await {
                     let cache = cache.clone();
                     let _ = tokio::task::spawn_blocking(move || cache.store(&good)).await;
                 }
-            });
+            }));
             tx
         });
         let has6 = udp6.is_some();
@@ -328,7 +334,11 @@ impl Client {
         if has6 {
             tasks.push(tokio::spawn(recv(sh.clone(), true)));
         }
-        Ok(Client { sh, tasks })
+        Ok(Client {
+            sh,
+            tasks,
+            cache_task,
+        })
     }
 
     /// Opens a stream to addr (host:port) through the tunnel, handshaking first if needed. Bytes
@@ -375,6 +385,24 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl Client {
+    /// Closes the client: ends the session and stops its tasks, then waits until any resolvers
+    /// queued for the cache are stored. Dropping the Client does the same without waiting, so
+    /// a snapshot queued just before the runtime shuts down could still be lost; call this when
+    /// the cache matters.
+    pub async fn close(mut self) {
+        self.shutdown();
+        if let Some(t) = self.cache_task.take() {
+            let _ = t.await;
+        }
+    }
+
+    /// Ends the session and stops the client's tasks. Idempotent.
+    fn shutdown(&mut self) {
         self.sh.core().close();
         lock(&self.sh.cache).take();
         // The driver won't dispatch the close any more: wake every stream's waiters now, so
