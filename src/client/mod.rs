@@ -348,7 +348,7 @@ impl Client {
         loop {
             {
                 let mut c = self.sh.core();
-                c.connect();
+                c.connect(Instant::now());
                 if c.established().is_some() {
                     let r = c.open_stream(addr).map_err(io::Error::other)?;
                     drop(c);
