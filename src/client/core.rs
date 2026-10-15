@@ -530,6 +530,9 @@ impl ClientCore {
         if cfg.hold.is_zero() {
             cfg.hold = d.hold;
         }
+        if cfg.session_idle.is_zero() {
+            cfg.session_idle = d.session_idle;
+        }
         cfg.max_qname = cfg.max_qname.min(dns::MAX_NAME);
         cfg.safe_qname = cfg.safe_qname.min(cfg.max_qname);
         if zone.max_payload(cfg.safe_qname) < 2 + PUB_LEN {
@@ -708,9 +711,11 @@ impl ClientCore {
         }
     }
 
-    /// Starts a handshake if there's no live session, or if the live one has sat idle past
-    /// `session_idle`. Established arrives as an event.
-    pub fn connect(&mut self, now: Instant) {
+    /// Ends the live session if it has had no streams and no authenticated answer for
+    /// `session_idle`, so the next connect handshakes afresh rather than open a stream on a
+    /// session the server may have forgotten. Call it once per connect attempt, before waiting
+    /// on a handshake, never in the loop that waits: a fresh session must get its stream.
+    pub fn retire_idle(&mut self, now: Instant) {
         if let Some(ClientSession {
             s: Some(s),
             last_auth: Some(t),
@@ -723,6 +728,10 @@ impl ClientCore {
             s.close("soar: session idle");
             self.pump();
         }
+    }
+
+    /// Starts a handshake if there's no live session. Established arrives as an event.
+    pub fn connect(&mut self) {
         let live = self
             .sess
             .as_ref()
@@ -1588,11 +1597,13 @@ mod tests {
         let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
         let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
         (cfg.max_inflight, cfg.max_path_window, cfg.max_streams) = (0, 0, 0);
+        cfg.session_idle = Duration::ZERO;
         let mut c = ClientCore::new(cfg, now).unwrap();
-        c.connect(now);
+        c.connect();
         c.tick(now);
         assert_eq!(c.take_transmits().len(), 1, "the hello goes out");
         assert_eq!(c.cfg.max_path_window, 32);
+        assert_eq!(c.cfg.session_idle, Duration::from_secs(90));
     }
 
     #[test]
@@ -1602,7 +1613,7 @@ mod tests {
         let resolvers: Vec<String> = (1..=20).map(|i| format!("192.0.2.{i}:53")).collect();
         let refs: Vec<&str> = resolvers.iter().map(String::as_str).collect();
         let mut c = ClientCore::new(ClientConfig::new("t.example.com", key, &refs), t0).unwrap();
-        c.connect(t0);
+        c.connect();
         c.tick(t0);
         assert_eq!(c.take_transmits().len(), MAX_HELLO_PATHS);
         // Nothing answers; the hellos expire and retry. The four never tried go first.
@@ -1626,7 +1637,7 @@ mod tests {
             t0,
         )
         .unwrap();
-        c.connect(t0);
+        c.connect();
         c.tick(t0);
         assert_eq!(c.take_transmits().len(), 1);
         c.close();
@@ -1741,7 +1752,7 @@ mod tests {
             q.deadline = now + Duration::from_secs(60);
             c.pending.insert(txn, q);
         }
-        c.connect(now);
+        c.connect();
         c.tick(now);
         assert!(c.take_transmits().is_empty());
     }
@@ -1761,7 +1772,7 @@ mod tests {
             q.deadline = now + Duration::from_secs(60);
             c.pending.insert(txn, q);
         }
-        c.connect(now);
+        c.connect();
         c.tick(now);
         assert!(
             c.pending.len() <= MAX_PENDING,
@@ -1844,10 +1855,10 @@ mod tests {
         );
     }
 
-    /// connect retires an established session left idle past session_idle, announcing its end,
+    /// retire_idle ends an established session left idle past session_idle, announcing its end,
     /// but not one younger than that or one with a stream still open.
     #[test]
-    fn connect_retires_only_an_idle_session() {
+    fn retire_idle_ends_only_an_idle_session() {
         let now = Instant::now();
         let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
         let cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
@@ -1874,7 +1885,7 @@ mod tests {
         };
         c.sess = Some(session());
         c.next_generation = 2; // as if connect had made generation 1
-        c.connect(now + idle - Duration::from_secs(1));
+        c.retire_idle(now + idle - Duration::from_secs(1));
         assert_eq!(
             c.established(),
             Some(1),
@@ -1882,7 +1893,7 @@ mod tests {
         );
 
         let r = c.open_stream("a:1").unwrap();
-        c.connect(now + idle * 2);
+        c.retire_idle(now + idle * 2);
         assert_eq!(
             c.established(),
             Some(1),
@@ -1892,7 +1903,8 @@ mod tests {
 
         c.sess = Some(session());
         c.events.clear();
-        c.connect(now + idle);
+        c.retire_idle(now + idle);
+        c.connect();
         assert!(c.established().is_none(), "the idle session was reused");
         assert_ne!(
             c.sess.as_ref().unwrap().generation,

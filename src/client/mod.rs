@@ -345,10 +345,12 @@ impl Client {
     /// may be written at once; [`Conn::opened`] waits for the server to reach addr.
     pub async fn connect(&self, addr: &str) -> io::Result<Conn> {
         let mut est = self.sh.established.subscribe();
+        // Once, not in the loop: a session that comes up while we wait is fresh by definition.
+        self.sh.core().retire_idle(Instant::now());
         loop {
             {
                 let mut c = self.sh.core();
-                c.connect(Instant::now());
+                c.connect();
                 if c.established().is_some() {
                     let r = c.open_stream(addr).map_err(io::Error::other)?;
                     drop(c);

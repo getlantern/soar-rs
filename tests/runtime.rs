@@ -85,6 +85,24 @@ async fn idle_session_is_retired_before_the_server_forgets_it() {
         .expect("first connect after idling failed");
 }
 
+/// Even a session_idle so short that every session is idle by the time it's used must not stop
+/// connect from opening a stream on the session it just waited for.
+#[tokio::test(flavor = "multi_thread")]
+async fn tiny_session_idle_still_connects() {
+    let (server, _srv) = start_server().await;
+    let dest = start_ponger().await;
+    let mut cfg = ClientConfig::new(ZONE, key().verifying_key(), &[&server]);
+    cfg.tcp = TcpMode::Off;
+    cfg.session_idle = Duration::from_nanos(1);
+    let c = Client::new(cfg).await.unwrap();
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(10), ping(&c, &dest))
+            .await
+            .expect("connect kept handshaking")
+            .unwrap();
+    }
+}
+
 async fn client(server: &str) -> Client {
     let mut cfg = ClientConfig::new(ZONE, key().verifying_key(), &[server]);
     cfg.tcp = TcpMode::Off;
