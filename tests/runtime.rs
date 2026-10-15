@@ -29,6 +29,80 @@ async fn start_server() -> (String, tokio::task::JoinHandle<std::io::Result<()>>
     )
 }
 
+/// A destination that answers each connection's "ping" with "pong".
+async fn start_ponger() -> String {
+    let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = ln.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = ln.accept().await {
+            tokio::spawn(async move {
+                let mut b = [0u8; 4];
+                if s.read_exact(&mut b).await.is_ok() && &b == b"ping" {
+                    let _ = s.write_all(b"pong").await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+async fn ping(c: &Client, dest: &str) -> std::io::Result<()> {
+    let mut conn = c.connect(dest).await?;
+    conn.write_all(b"ping").await?;
+    let mut b = [0u8; 4];
+    conn.read_exact(&mut b).await?;
+    assert_eq!(&b, b"pong");
+    Ok(())
+}
+
+/// A client idle past the server's idle timeout must not dial on the session the server ended:
+/// the first connect after the pause has to work, not fail with "server lost the session".
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_session_is_retired_before_the_server_forgets_it() {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server = sock.local_addr().unwrap().to_string();
+    let dial = DialPolicy {
+        allow_ports: None,
+        allow_private: true,
+        ..DialPolicy::default()
+    };
+    let mut scfg = ServerConfig::new(ZONE, key());
+    scfg.idle_timeout = Duration::from_secs(1);
+    tokio::spawn(serve(sock, scfg, dial));
+    let dest = start_ponger().await;
+    let mut cfg = ClientConfig::new(ZONE, key().verifying_key(), &[&server]);
+    cfg.tcp = TcpMode::Off;
+    cfg.session_idle = Duration::from_millis(500);
+    let c = Client::new(cfg).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), ping(&c, &dest))
+        .await
+        .expect("first ping timed out")
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await; // the server has ended the session by now
+    tokio::time::timeout(Duration::from_secs(10), ping(&c, &dest))
+        .await
+        .expect("ping after idling timed out")
+        .expect("first connect after idling failed");
+}
+
+/// Even a session_idle so short that every session is idle by the time it's used must not stop
+/// connect from opening a stream on the session it just waited for.
+#[tokio::test(flavor = "multi_thread")]
+async fn tiny_session_idle_still_connects() {
+    let (server, _srv) = start_server().await;
+    let dest = start_ponger().await;
+    let mut cfg = ClientConfig::new(ZONE, key().verifying_key(), &[&server]);
+    cfg.tcp = TcpMode::Off;
+    cfg.session_idle = Duration::from_nanos(1);
+    let c = Client::new(cfg).await.unwrap();
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(10), ping(&c, &dest))
+            .await
+            .expect("connect kept handshaking")
+            .unwrap();
+    }
+}
+
 async fn client(server: &str) -> Client {
     let mut cfg = ClientConfig::new(ZONE, key().verifying_key(), &[server]);
     cfg.tcp = TcpMode::Off;

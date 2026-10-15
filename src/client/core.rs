@@ -66,6 +66,11 @@ pub struct ClientConfig {
     /// Reports resolvers that only speak a stream transport: they get a TCP path from the start
     /// and never a UDP one, whatever `tcp` says.
     pub stream_only: Option<StreamOnly>,
+    /// Retires a session with no streams and no authenticated answer for this long: the next
+    /// connect handshakes again rather than reuse a session the server may have ended (an idle
+    /// client sends nothing, and the reference server forgets a session after 2 minutes of
+    /// silence). Keep it below the server's idle timeout.
+    pub session_idle: Duration,
 }
 
 impl ClientConfig {
@@ -86,6 +91,7 @@ impl ClientConfig {
             max_streams: 64,
             tcp: TcpMode::Auto,
             stream_only: None,
+            session_idle: Duration::from_secs(90),
         }
     }
 
@@ -524,6 +530,9 @@ impl ClientCore {
         if cfg.hold.is_zero() {
             cfg.hold = d.hold;
         }
+        if cfg.session_idle.is_zero() {
+            cfg.session_idle = d.session_idle;
+        }
         cfg.max_qname = cfg.max_qname.min(dns::MAX_NAME);
         cfg.safe_qname = cfg.safe_qname.min(cfg.max_qname);
         if zone.max_payload(cfg.safe_qname) < 2 + PUB_LEN {
@@ -699,6 +708,25 @@ impl ClientCore {
                     q.deadline = now;
                 }
             }
+        }
+    }
+
+    /// Ends the live session if it has had no streams and no authenticated answer for
+    /// `session_idle`, so the next connect handshakes afresh rather than open a stream on a
+    /// session the server may have forgotten. Call it once per connect attempt, before waiting
+    /// on a handshake, never in the loop that waits: a fresh session must get its stream.
+    pub fn retire_idle(&mut self, now: Instant) {
+        if let Some(ClientSession {
+            s: Some(s),
+            last_auth: Some(t),
+            ..
+        }) = &mut self.sess
+            && !s.is_closed()
+            && now.saturating_duration_since(*t) >= self.cfg.session_idle
+            && !(s.stream_count() > 0 || s.ctrl_pending() || s.data_in_flight())
+        {
+            s.close("soar: session idle");
+            self.pump();
         }
     }
 
@@ -1569,11 +1597,13 @@ mod tests {
         let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
         let mut cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
         (cfg.max_inflight, cfg.max_path_window, cfg.max_streams) = (0, 0, 0);
+        cfg.session_idle = Duration::ZERO;
         let mut c = ClientCore::new(cfg, now).unwrap();
         c.connect();
         c.tick(now);
         assert_eq!(c.take_transmits().len(), 1, "the hello goes out");
         assert_eq!(c.cfg.max_path_window, 32);
+        assert_eq!(c.cfg.session_idle, Duration::from_secs(90));
     }
 
     #[test]
@@ -1822,6 +1852,70 @@ mod tests {
         assert!(
             c.established().is_none(),
             "the session wasn't presumed lost"
+        );
+    }
+
+    /// retire_idle ends an established session left idle past session_idle, announcing its end,
+    /// but not one younger than that or one with a stream still open.
+    #[test]
+    fn retire_idle_ends_only_an_idle_session() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
+        let idle = cfg.session_idle;
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        let pc = || crate::crypto::PacketCipher {
+            key: [1; 32],
+            iv: [2; 12],
+            hp: [3; 32],
+        };
+        let scfg = StreamConfig {
+            stream_window: 1 << 16,
+            send_buffer: 1 << 16,
+            max_streams: 4,
+        };
+        let session = || ClientSession {
+            generation: 1,
+            eph: StaticSecret::from([4; 32]),
+            s: Some(Session::new(true, scfg, pc(), pc())),
+            sid: 1,
+            backlog: 0,
+            last_auth: Some(now),
+            unanswered: None,
+        };
+        c.sess = Some(session());
+        c.next_generation = 2; // as if connect had made generation 1
+        c.retire_idle(now + idle - Duration::from_secs(1));
+        assert_eq!(
+            c.established(),
+            Some(1),
+            "a session not yet idle was retired"
+        );
+
+        let r = c.open_stream("a:1").unwrap();
+        c.retire_idle(now + idle * 2);
+        assert_eq!(
+            c.established(),
+            Some(1),
+            "a session with a stream open was retired"
+        );
+        c.close_stream(r);
+
+        c.sess = Some(session());
+        c.events.clear();
+        c.retire_idle(now + idle);
+        c.connect();
+        assert!(c.established().is_none(), "the idle session was reused");
+        assert_ne!(
+            c.sess.as_ref().unwrap().generation,
+            1,
+            "no new handshake began"
+        );
+        assert!(
+            c.events
+                .iter()
+                .any(|e| matches!(e, ClientEvent::SessionClosed(1))),
+            "the idle session's end wasn't announced"
         );
     }
 
