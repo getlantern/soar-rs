@@ -103,6 +103,102 @@ async fn tiny_session_idle_still_connects() {
     }
 }
 
+/// Relays queries to `server` but holds the answers until `release`, so a test can drop a connect
+/// while its hello is answered but not yet delivered.
+struct GatedResolver {
+    addr: String,
+    front: std::sync::Arc<UdpSocket>,
+    held: HeldAnswers,
+}
+
+/// Answers waiting for release, or None once released.
+type HeldAnswers = std::sync::Arc<std::sync::Mutex<Option<Vec<(Vec<u8>, std::net::SocketAddr)>>>>;
+
+impl GatedResolver {
+    async fn start(server: &str) -> GatedResolver {
+        let front = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = front.local_addr().unwrap().to_string();
+        let held = std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+        let (f, h, server) = (front.clone(), held.clone(), server.to_owned());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, from)) = f.recv_from(&mut buf).await {
+                let (msg, f, h, server) = (buf[..n].to_vec(), f.clone(), h.clone(), server.clone());
+                tokio::spawn(async move {
+                    let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    back.send_to(&msg, &server).await.unwrap();
+                    let mut rb = vec![0u8; 4096];
+                    let Ok(Ok((m, _))) =
+                        tokio::time::timeout(Duration::from_secs(3), back.recv_from(&mut rb)).await
+                    else {
+                        return;
+                    };
+                    let answer = rb[..m].to_vec();
+                    if let Some(q) = h.lock().unwrap().as_mut() {
+                        return q.push((answer, from));
+                    }
+                    let _ = f.send_to(&answer, from).await;
+                });
+            }
+        });
+        GatedResolver { addr, front, held }
+    }
+
+    fn held(&self) -> usize {
+        self.held.lock().unwrap().as_ref().map_or(0, Vec::len)
+    }
+
+    async fn release(&self) {
+        let q = self.held.lock().unwrap().take().unwrap_or_default();
+        for (answer, to) in q {
+            let _ = self.front.send_to(&answer, to).await;
+        }
+    }
+}
+
+/// A connect abandoned mid-handshake, as when another transport wins a race, leaves a session
+/// that never carries a stream once the hello's answer arrives. The server ends it 15 s after the
+/// hello, so a later connect must handshake afresh rather than fail with SessionClosed.
+#[tokio::test(flavor = "multi_thread")]
+async fn abandoned_connect_does_not_strand_a_session() {
+    let (server, _srv) = start_server().await;
+    let dest = start_ponger().await;
+    let resolver = GatedResolver::start(&server).await;
+    let mut cfg = ClientConfig::new(ZONE, key().verifying_key(), &[&resolver.addr]);
+    cfg.tcp = TcpMode::Off;
+    let c = Client::new(cfg).await.unwrap();
+
+    let mut connect = Box::pin(c.connect(&dest));
+    let answered = async {
+        while resolver.held() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        r = connect.as_mut() => panic!("connect finished with its hello answer held back: {:?}", r.err()),
+        _ = tokio::time::timeout(Duration::from_secs(5), answered) => {}
+    }
+    assert!(resolver.held() > 0, "the server never answered the hello");
+    drop(connect);
+    resolver.release().await;
+    let up = tokio::time::timeout(Duration::from_secs(5), async {
+        while !c.established() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        up.is_ok(),
+        "the abandoned handshake never left an established session"
+    );
+
+    tokio::time::sleep(Duration::from_secs(16)).await; // past the server's 15 s unused limit
+    tokio::time::timeout(Duration::from_secs(10), ping(&c, &dest))
+        .await
+        .expect("ping timed out")
+        .expect("connect after an abandoned handshake failed");
+}
+
 async fn client(server: &str) -> Client {
     let mut cfg = ClientConfig::new(ZONE, key().verifying_key(), &[server]);
     cfg.tcp = TcpMode::Off;
