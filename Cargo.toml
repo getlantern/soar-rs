@@ -1,6 +1,6 @@
 [package]
 name = "soar"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A wire-compatible Rust implementation of Soar, a DNS tunnel for networks that censor everything but DNS"
