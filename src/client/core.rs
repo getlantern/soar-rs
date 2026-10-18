@@ -122,6 +122,9 @@ const DEAD_SESSION_AFTER: Duration = Duration::from_secs(15);
 /// abandoned mid-handshake, as when another transport wins a race, and the handshake completes
 /// anyway.
 const UNUSED_SESSION_IDLE: Duration = Duration::from_secs(10);
+/// Spares a session that has only just come up from UNUSED_SESSION_IDLE: a connect waiting on
+/// its handshake is about to open a stream on it.
+const FRESH_SESSION_GRACE: Duration = Duration::from_secs(1);
 /// Outcomes per side before an answer-size trial can pass.
 const TRIAL_SAMPLES: usize = 16;
 /// Successes at the proven size before a trial.
@@ -469,6 +472,8 @@ struct ClientSession {
     last_auth: Option<Instant>,
     /// A stream has been opened on it.
     used: bool,
+    /// When its first hello went out.
+    first_hello: Option<Instant>,
     /// When the first query since the last authenticated answer went out.
     unanswered: Option<Instant>,
 }
@@ -723,19 +728,29 @@ impl ClientCore {
     /// afresh rather than open a stream on a session the server may have forgotten. Call it once per connect attempt, before waiting
     /// on a handshake, never in the loop that waits: a fresh session must get its stream.
     pub fn retire_idle(&mut self, now: Instant) {
-        if let Some(ClientSession {
+        let Some(ClientSession {
             s: Some(s),
-            last_auth: Some(t),
+            last_auth: Some(auth),
             used,
+            first_hello,
             ..
         }) = &mut self.sess
-            && !s.is_closed()
-            && now.saturating_duration_since(*t)
-                >= if *used {
-                    self.cfg.session_idle
-                } else {
-                    self.cfg.session_idle.min(UNUSED_SESSION_IDLE)
-                }
+        else {
+            return;
+        };
+        let (since, limit) = if *used {
+            (*auth, self.cfg.session_idle)
+        } else {
+            // The server times an unused session from its hello, and a retried hello gets the
+            // same session back, so a slow handshake has already used up part of the limit.
+            let since = match first_hello {
+                Some(h) if now.saturating_duration_since(*auth) >= FRESH_SESSION_GRACE => *h,
+                _ => *auth,
+            };
+            (since, self.cfg.session_idle.min(UNUSED_SESSION_IDLE))
+        };
+        if !s.is_closed()
+            && now.saturating_duration_since(since) >= limit
             && !(s.stream_count() > 0 || s.ctrl_pending() || s.data_in_flight())
         {
             s.close("soar: session idle");
@@ -762,6 +777,7 @@ impl ClientCore {
             backlog: 0,
             last_auth: None,
             used: false,
+            first_hello: None,
             unanswered: None,
         });
         for p in &mut self.paths {
@@ -1077,6 +1093,8 @@ impl ClientCore {
                 continue;
             }
             p.last_hello = Some(now);
+            let cs = self.sess.as_mut().expect("checked");
+            cs.first_hello.get_or_insert(now);
             let q = self.query(id, generation, now);
             self.send(
                 id,
@@ -1717,6 +1735,7 @@ mod tests {
             backlog: 0,
             last_auth: Some(now),
             used: false,
+            first_hello: None,
             unanswered: None,
         });
         let r = c.open_stream("a:1").unwrap();
@@ -1836,6 +1855,7 @@ mod tests {
             backlog: 0,
             last_auth: Some(now),
             used: false,
+            first_hello: None,
             unanswered: None,
         });
         let r = c.open_stream("a:1").unwrap();
@@ -1899,6 +1919,7 @@ mod tests {
             backlog: 0,
             last_auth: Some(now),
             used: true,
+            first_hello: None,
             unanswered: None,
         };
         c.sess = Some(session());
@@ -1963,6 +1984,7 @@ mod tests {
             backlog: 0,
             last_auth: Some(now),
             used: false,
+            first_hello: None,
             unanswered: None,
         });
         c.next_generation = 2;
@@ -1987,6 +2009,7 @@ mod tests {
             backlog: 0,
             last_auth: Some(now),
             used: false,
+            first_hello: None,
             unanswered: None,
         });
         let r = c.open_stream("a:1").unwrap();
@@ -1994,6 +2017,50 @@ mod tests {
         assert!(
             c.sess.as_ref().unwrap().used,
             "opening a stream didn't mark the session used"
+        );
+    }
+
+    /// The server times an unused session from its hello, and a retried hello gets the same
+    /// session back, so a handshake whose reply came late is judged from the first hello. A
+    /// session that has only just come up is spared: a connect waiting on it is about to use it.
+    #[test]
+    fn unused_session_age_counts_from_first_hello() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        let pc = || crate::crypto::PacketCipher {
+            key: [1; 32],
+            iv: [2; 12],
+            hp: [3; 32],
+        };
+        let scfg = StreamConfig {
+            stream_window: 1 << 16,
+            send_buffer: 1 << 16,
+            max_streams: 4,
+        };
+        c.sess = Some(ClientSession {
+            generation: 1,
+            eph: StaticSecret::from([4; 32]),
+            s: Some(Session::new(true, scfg, pc(), pc())),
+            sid: 1,
+            backlog: 0,
+            last_auth: Some(now),
+            used: false,
+            first_hello: Some(now - UNUSED_SESSION_IDLE),
+            unanswered: None,
+        });
+        c.next_generation = 2;
+        c.retire_idle(now + FRESH_SESSION_GRACE / 2);
+        assert_eq!(
+            c.established(),
+            Some(1),
+            "a session that just came up was retired"
+        );
+        c.retire_idle(now + Duration::from_secs(3));
+        assert!(
+            c.established().is_none(),
+            "an unused session whose hello is past the limit was kept"
         );
     }
 
