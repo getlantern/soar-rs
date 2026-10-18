@@ -117,6 +117,11 @@ const MAX_HELLO_PATHS: usize = 16;
 /// presumed lost. The server's signed unknown-session answer is the fast path; this is the
 /// backstop, since its signing is rate-limited.
 const DEAD_SESSION_AFTER: Duration = Duration::from_secs(15);
+/// Retires a session that has never carried a stream. The server ends such a session 15 s after
+/// its hello (SPEC 7.4), much sooner than an idle one. It is left behind when a connect is
+/// abandoned mid-handshake, as when another transport wins a race, and the handshake completes
+/// anyway.
+const UNUSED_SESSION_IDLE: Duration = Duration::from_secs(10);
 /// Outcomes per side before an answer-size trial can pass.
 const TRIAL_SAMPLES: usize = 16;
 /// Successes at the proven size before a trial.
@@ -462,6 +467,8 @@ struct ClientSession {
     sid: u16,
     backlog: usize,
     last_auth: Option<Instant>,
+    /// A stream has been opened on it.
+    used: bool,
     /// When the first query since the last authenticated answer went out.
     unanswered: Option<Instant>,
 }
@@ -712,17 +719,23 @@ impl ClientCore {
     }
 
     /// Ends the live session if it has had no streams and no authenticated answer for
-    /// `session_idle`, so the next connect handshakes afresh rather than open a stream on a
-    /// session the server may have forgotten. Call it once per connect attempt, before waiting
+    /// `session_idle` (or 10 s, if it never carried a stream), so the next connect handshakes
+    /// afresh rather than open a stream on a session the server may have forgotten. Call it once per connect attempt, before waiting
     /// on a handshake, never in the loop that waits: a fresh session must get its stream.
     pub fn retire_idle(&mut self, now: Instant) {
         if let Some(ClientSession {
             s: Some(s),
             last_auth: Some(t),
+            used,
             ..
         }) = &mut self.sess
             && !s.is_closed()
-            && now.saturating_duration_since(*t) >= self.cfg.session_idle
+            && now.saturating_duration_since(*t)
+                >= if *used {
+                    self.cfg.session_idle
+                } else {
+                    self.cfg.session_idle.min(UNUSED_SESSION_IDLE)
+                }
             && !(s.stream_count() > 0 || s.ctrl_pending() || s.data_in_flight())
         {
             s.close("soar: session idle");
@@ -748,6 +761,7 @@ impl ClientCore {
             sid: 0,
             backlog: 0,
             last_auth: None,
+            used: false,
             unanswered: None,
         });
         for p in &mut self.paths {
@@ -1501,6 +1515,7 @@ impl ClientCore {
         let cs = self.sess.as_mut().ok_or(StreamError::SessionClosed)?;
         let s = cs.s.as_mut().ok_or(StreamError::SessionClosed)?;
         let id = s.open_stream(addr)?;
+        cs.used = true;
         Ok(StreamRef {
             session: cs.generation,
             id,
@@ -1701,6 +1716,7 @@ mod tests {
             sid: 1,
             backlog: 0,
             last_auth: Some(now),
+            used: false,
             unanswered: None,
         });
         let r = c.open_stream("a:1").unwrap();
@@ -1819,6 +1835,7 @@ mod tests {
             sid: 1,
             backlog: 0,
             last_auth: Some(now),
+            used: false,
             unanswered: None,
         });
         let r = c.open_stream("a:1").unwrap();
@@ -1881,6 +1898,7 @@ mod tests {
             sid: 1,
             backlog: 0,
             last_auth: Some(now),
+            used: true,
             unanswered: None,
         };
         c.sess = Some(session());
@@ -1916,6 +1934,66 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ClientEvent::SessionClosed(1))),
             "the idle session's end wasn't announced"
+        );
+    }
+
+    /// A session that never carried a stream is retired after UNUSED_SESSION_IDLE, well before
+    /// session_idle, since the server ends it 15 s after its hello.
+    #[test]
+    fn retire_idle_ends_an_unused_session_sooner() {
+        let now = Instant::now();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let cfg = ClientConfig::new("t.example.com", key, &["192.0.2.1:53"]);
+        let mut c = ClientCore::new(cfg, now).unwrap();
+        let pc = || crate::crypto::PacketCipher {
+            key: [1; 32],
+            iv: [2; 12],
+            hp: [3; 32],
+        };
+        let scfg = StreamConfig {
+            stream_window: 1 << 16,
+            send_buffer: 1 << 16,
+            max_streams: 4,
+        };
+        c.sess = Some(ClientSession {
+            generation: 1,
+            eph: StaticSecret::from([4; 32]),
+            s: Some(Session::new(true, scfg, pc(), pc())),
+            sid: 1,
+            backlog: 0,
+            last_auth: Some(now),
+            used: false,
+            unanswered: None,
+        });
+        c.next_generation = 2;
+        c.retire_idle(now + UNUSED_SESSION_IDLE - Duration::from_secs(1));
+        assert_eq!(
+            c.established(),
+            Some(1),
+            "an unused session not yet idle was retired"
+        );
+        c.retire_idle(now + UNUSED_SESSION_IDLE);
+        assert!(
+            c.established().is_none(),
+            "an unused session past the limit was kept"
+        );
+
+        // Opening a stream marks a session used, so it then gets the full session_idle.
+        c.sess = Some(ClientSession {
+            generation: 3,
+            eph: StaticSecret::from([4; 32]),
+            s: Some(Session::new(true, scfg, pc(), pc())),
+            sid: 1,
+            backlog: 0,
+            last_auth: Some(now),
+            used: false,
+            unanswered: None,
+        });
+        let r = c.open_stream("a:1").unwrap();
+        c.close_stream(r);
+        assert!(
+            c.sess.as_ref().unwrap().used,
+            "opening a stream didn't mark the session used"
         );
     }
 

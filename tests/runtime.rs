@@ -103,6 +103,27 @@ async fn tiny_session_idle_still_connects() {
     }
 }
 
+/// A connect abandoned mid-handshake, as when another transport wins a race, leaves a session
+/// that never carries a stream. The server ends it 15 s after the hello, so a later connect must
+/// handshake afresh rather than fail with SessionClosed.
+#[tokio::test(flavor = "multi_thread")]
+async fn abandoned_connect_does_not_strand_a_session() {
+    let (server, _srv) = start_server().await;
+    let dest = start_ponger().await;
+    let c = client(&server).await;
+    if tokio::time::timeout(Duration::from_millis(1), c.connect(&dest))
+        .await
+        .is_ok()
+    {
+        return; // the handshake beat a 1 ms deadline, so there's nothing to test
+    }
+    tokio::time::sleep(Duration::from_secs(16)).await; // past the server's 15 s unused limit
+    tokio::time::timeout(Duration::from_secs(10), ping(&c, &dest))
+        .await
+        .expect("ping timed out")
+        .expect("connect after an abandoned handshake failed");
+}
+
 async fn client(server: &str) -> Client {
     let mut cfg = ClientConfig::new(ZONE, key().verifying_key(), &[server]);
     cfg.tcp = TcpMode::Off;
